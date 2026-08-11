@@ -136,6 +136,74 @@ This one has a hard silicon limit worth knowing before designing around it:
   playing** — the phone as the listening device, which also fits "phone does the
   heavy lifting."
 
+### The "out and about" architecture: phone as a local brain (walkie-talkie)
+
+When away from home the console (a home PC) is not reachable unless it is
+internet-exposed — a real gap in the WiFi-hotspot path. The better answer pairs
+Beagledex to the user's phone (Oppo Find N3) over BLE and lets the *phone* be the
+orchestrator: Beagledex is mic + push-to-talk + screen; the phone does the work.
+
+    Beagledex  --BLE GATT-->  Oppo app  --cellular-->  MCP / agent endpoint
+       PTT + mic                STT (Android, free)
+       + screen                 TTS (Android, free) --> user's earbuds
+                                calls the endpoint directly
+
+Why this is the right shape for heavy on-the-go use:
+
+- **Cost → near zero.** Android's built-in SpeechRecognizer and TextToSpeech run
+  on-device for free, so STT and TTS leave the bill entirely. Only the call to the
+  user's own MCP/agent endpoint remains — over their own cellular to their own
+  infra.
+- **Battery, both devices.** BLE draws roughly an eighth of WiFi on Beagledex, and
+  there is no phone-hotspot AP radio burning on the phone. This is the real battery
+  win, not a hotspot.
+- **Privacy.** Voicing backend/infra commands no longer ships your ops chatter to a
+  third-party STT/LLM — STT/TTS stay on the phone, and the command goes only to your
+  own endpoint.
+- **Fixes reachability.** The phone is always with you and always has the uplink, so
+  there is no "expose the home console to the internet" problem.
+
+The hard constraints, stated honestly:
+
+- **It needs a companion Android app.** This is the single biggest build in the
+  project and a new platform — everything else is firmware + a Node console. That is
+  the whole cost of this route.
+- **BLE only (no Classic).** So it is a custom GATT link, not a standard headset
+  profile. Raw 16 kHz PCM is 256 kbit/s — feasible as a *burst* after PTT release
+  (a few hundred KB, which BLE 5 handles), but real-time bidirectional streaming is
+  where it gets hard. Compress (ADPCM ~4:1) if streaming is ever needed.
+- **Avoid audio-return over BLE.** The clean design has the **phone speak the reply
+  to the user's earbuds**, not send audio back to Beagledex — that sidesteps the
+  harder BLE direction and gives private listening for free. Beagledex still shows
+  the rendered text on screen; the phone handles sound.
+
+Firmware side: add a NimBLE GATT server as an alternate transport alongside WiFi —
+BLE-to-phone when out, WiFi when home, same PTT and same device UI. The device stays
+dumb either way.
+
+Sequencing: this is a multi-session, new-platform effort. Prove the value first with
+what exists (hotspot + console-local STT/TTS), and commit to the app only when
+on-the-go is genuinely the primary use. Do not start the mobile app without an
+explicit decision to take on mobile development.
+
+### Cost levers (console-side, device untouched)
+
+Independent of transport, because the device is dumb and every lever is a console
+or phone change:
+
+1. **Local STT + local TTS** on whatever host is the brain — `faster-whisper` +
+   `Piper` on the PC console, or Android's built-in STT/TTS on the phone. Removes
+   two of the three cloud costs and keeps voice in-house. Biggest lever.
+2. **Intent matching before the LLM.** A finite command set can be matched on the
+   host with fuzzy rules; the LLM is only the fallback for novel/ambiguous input, so
+   most commands cost no LLM call at all — and are faster and more predictable.
+3. **Prompt-cache the MCP tool definitions.** The constant system prompt + tool
+   schemas cache; you pay only the variable part. xAI already reports cached_tokens.
+4. **Trim the audio.** STT is priced per second — voice-activity-trim silence and cap
+   capture length. Free savings, also helps latency and battery.
+5. **Cache repeated replies** (SD card, hashed by text). "Done" / "all healthy"
+   replay at zero cost.
+
 ### Build order when resumed
 
 1. `/api/agent`: STT → forward text to the agent/MCP endpoint → condense with the
@@ -143,8 +211,9 @@ This one has a hard silicon limit worth knowing before designing around it:
 2. Agent app in the registry: PTT, show the transcript, speak the reply. ~one
    screen, copied from the Translate app.
 3. Confirmation UX for anything that acts, before exposing write-capable tools.
-4. BLE relay (phase 6) only if private/phone listening is actually wanted; the
-   speaker path needs none of it.
+4. Console-local STT/TTS + intent matching — the cost levers above, all host-side.
+5. BLE + phone-brain relay (the walkie-talkie) — the on-the-go endgame, gated on a
+   decision to build a mobile app.
 
 ### Naming
 
