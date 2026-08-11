@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.17.0";
+static const char *FW_VERSION = "0.17.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -1215,7 +1215,7 @@ static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY)
  * now means considerably more than a clock — same reasoning as audio.loopback:
  * the id is a stable key, the meaning is allowed to move. */
 static App APPS[] = {
-  { "app.clock",    "Face",      "swipe up for apps",         faceEnter,     faceTick,     faceGesture,     nullptr,    true  },
+  { "app.clock",    "Home",      "swipe up for apps",         faceEnter,     faceTick,     faceGesture,     nullptr,    true  },
   { "app.ask",      "Translate", "hold BOOT \xB7 tap a row",  askEnter,      askTick,      askGesture,      askCapture, false },
   { "app.settings", "Settings",  "tap a row \xB7 swipe down", settingsEnter, settingsTick, settingsGesture, nullptr,    false },
 };
@@ -1373,32 +1373,34 @@ static void lockNow() {
 }
 
 /* ── the launcher (home menu) ──────────────────────────────────────────────────
- * The app grid. Swipe up from anywhere to open it, tap a tile to launch, swipe
- * down to drop back to the face. This replaces the old swipe-through ring: with a
- * fourth app coming (the agent), cycling was already the wrong shape. Tiles are
- * a 2-column grid so it scales to six apps before it ever needs to scroll.
+ * A vertical list of full-width cards, one per app. Swipe up from anywhere to
+ * open it, tap a card to launch, swipe down to drop back to Home. Full-width rows
+ * rather than a grid of tiles: a whole row is a far larger, more forgiving tap
+ * target than a small square, and the app names read left to right the way a list
+ * should. Fits four cards comfortably; a fifth is where scrolling would start.
  */
-static constexpr int16_t LN_TOP  = 72;
-static constexpr int16_t LN_GAP  = 10;
-static constexpr int16_t LN_CW   = (LCD_WIDTH - 2 * PAD - LN_GAP) / 2;
-static constexpr int16_t LN_CH   = 100;
+static constexpr int16_t LN_TOP    = 60;
+static constexpr int16_t LN_GAP    = 12;
+static constexpr int16_t LN_CARD_H = 74;
 
 static void launcherPaint() {
   gfx->fillScreen(C_BG);
   gfx->setTextSize(2); gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD, 20);
+  gfx->setCursor(PAD, 22);
   gfx->print("Apps");
   gfx->setTextColor(C_FAINT);
-  gfx->setCursor(LCD_WIDTH - PAD - 108, 20);
-  gfx->print("swipe down \x19");             // ▼ back to the face
+  gfx->setCursor(LCD_WIDTH - PAD - 112, 22);
+  gfx->print("swipe down \x19");             // ▼ back to Home
 
   for (int i = 0; i < APP_COUNT; i++) {
-    const int16_t x = PAD + (i & 1) * (LN_CW + LN_GAP);
-    const int16_t y = LN_TOP + (i / 2) * (LN_CH + LN_GAP);
-    gfx->fillRoundRect(x, y, LN_CW, LN_CH, 12, C_CARD);
+    const int16_t y = LN_TOP + i * (LN_CARD_H + LN_GAP);
+    gfx->fillRoundRect(PAD, y, BODY_W, LN_CARD_H, 12, C_CARD);
     gfx->setTextSize(3); gfx->setTextColor(C_ACCENT);
-    gfx->setCursor(x + 14, y + LN_CH / 2 - 10);
+    gfx->setCursor(PAD + 18, y + LN_CARD_H / 2 - 11);
     gfx->print(APPS[i].title);
+    gfx->setTextSize(2); gfx->setTextColor(C_FAINT);   // chevron: this row opens
+    gfx->setCursor(LCD_WIDTH - PAD - 26, y + LN_CARD_H / 2 - 7);
+    gfx->print(">");
   }
 }
 
@@ -1409,10 +1411,11 @@ static void openLauncher() {
 }
 
 static void launcherTap(uint16_t x, uint16_t y) {
+  (void)x;                                    // full-width rows: only y selects
   if (y < LN_TOP) return;
-  const int row = (y - LN_TOP) / (LN_CH + LN_GAP);
-  const int col = x < PAD + LN_CW + LN_GAP / 2 ? 0 : 1;
-  const int idx = row * 2 + col;
+  const int idx = (y - LN_TOP) / (LN_CARD_H + LN_GAP);
+  const int16_t cardTop = LN_TOP + idx * (LN_CARD_H + LN_GAP);
+  if (y > cardTop + LN_CARD_H) return;        // landed in the gap between cards
   if (idx >= 0 && idx < APP_COUNT) enterApp(idx);   // clears launcherOpen
 }
 
