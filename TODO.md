@@ -121,6 +121,22 @@ npm run push time            # set the RTC from this machine's clock
 8. **Light sleep**, once (1) gives the device a transport other than USB serial. See the
    power notes below; it is the ~50× lever, worth far more than every other item here.
 
+## The next real blocker: CJK text cannot be drawn
+
+Arduino_GFX's built-in font is ASCII. Japanese, Chinese, Korean and Thai render as
+mojibake, which looks like a fault rather than a missing feature — so the Translate
+app detects non-ASCII and says so instead. Latin-script targets (Spanish, French,
+German, Indonesian, Malay, Vietnamese without diacritics) draw correctly today.
+
+**The fix is the trick the watch face already uses**: have the console rasterise the
+reply to an RGB565 strip with a real font and send that; the device blits it. Windows
+ships CJK-capable fonts, PIL can render them, `scripts/face.py` already proves the
+conversion and preview round-trip, and the device gains no font data and no decoder.
+A 368x120 strip is 88 KB, which is nothing over WiFi.
+
+This is also the right long-term shape: the host owns typography for the same reason
+it owns the API key and the image pipeline.
+
 ## Open questions
 
 - **Mic path** — see 3 above. Blocks anything that depends on captured audio meaning

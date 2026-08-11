@@ -96,7 +96,11 @@ export default defineEventHandler(async (event) => {
     fd.append('audio_format', 'pcm')
     fd.append('sample_rate', '16000')
   }
-  if (fromCode && fromCode !== 'auto') fd.append('language', fromCode)
+  /* With auto-direction on (the default) we deliberately do NOT hint the language,
+   * because the hint biases detection and detection is what decides which way to
+   * translate. Pass &auto=0 to force the stated direction. */
+  const autoDirect = (q.auto ?? '1') !== '0'
+  if (!autoDirect && fromCode && fromCode !== 'auto') fd.append('language', fromCode)
   fd.append('file', new Blob([new Uint8Array(mono)]),
             container ? `capture.${container[1] === 'mpeg' ? 'mp3' : container[1]}` : 'capture.pcm')
 
@@ -115,13 +119,22 @@ export default defineEventHandler(async (event) => {
   const msStt = Date.now() - t0
   if (container && stt.duration) seconds = +stt.duration.toFixed(2)
 
+  /* Which way round? In a two-way conversation the speaker changes every few
+   * seconds, and a direction toggle is one more thing to fumble mid-sentence. So
+   * the detected language decides: say the far-side language and it comes back in
+   * yours. Two selections and one button, with no third control to get wrong. */
+  const spoke = (stt.language || fromCode).toLowerCase()
+  const targetCode = autoDirect && spoke === toCode.toLowerCase() ? fromCode : toCode
+
   const reply = (translation: string, msChat: number) => {
     setHeader(event, 'X-Transcript', encodeURIComponent(transcript))
     setHeader(event, 'X-Translation', encodeURIComponent(translation))
-    setHeader(event, 'X-Detected', stt.language || fromCode)
+    setHeader(event, 'X-Detected', spoke)
+    setHeader(event, 'X-Target', targetCode)
     return {
       transcript, translation,
-      detected: stt.language || fromCode,
+      detected: spoke,
+      target: targetCode,
       pair, seconds,
       ms: { stt: msStt, chat: msChat, total: msStt + msChat },
     }
@@ -147,8 +160,8 @@ export default defineEventHandler(async (event) => {
           // and a model that editorialises makes the device look broken.
           content: `You translate speech for a two-way conversation between a `
             + `${languageName(fromCode)} speaker and a ${languageName(toCode)} speaker. `
-            + `Translate the user's ${languageName(fromCode)} into natural, spoken `
-            + `${languageName(toCode)}. Reply with the translation only — no notes, `
+            + `Translate the user's words into natural, spoken `
+            + `${languageName(targetCode)}. Reply with the translation only — no notes, `
             + `no romanisation, no quotation marks. If the input is not meaningful `
             + `speech, reply with an empty string.`,
         },

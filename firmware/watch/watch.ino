@@ -65,6 +65,9 @@
 #include <ESP_I2S.h>
 #include <esp_mac.h>
 #include <esp_partition.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
 #include <Arduino_GFX_Library.h>
 #include <math.h>
 #include "pin_config.h"
@@ -74,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.7.0";
+static const char *FW_VERSION = "0.8.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -173,6 +176,78 @@ static size_t cacheGet(const char *key, uint8_t *out, size_t cap) {
   (void)out; (void)cap;
   if (!cacheReady()) { LOGW("cache", "no card: miss %s", key); return 0; }
   return 0;
+}
+
+/* ── network: provisioned over serial, stored in NVS ─────────────────────────
+ * Credentials arrive as host commands and live in NVS, which was 840 KB of
+ * otherwise unused partition. Deliberately NOT in secrets.h — that means a
+ * rebuild to change networks and is one careless commit from being public — and
+ * deliberately NOT in config/devices/*.json, because that file is tracked in git
+ * and a WiFi password has no business in version control.
+ *
+ *   npm run push wifi "<ssid>" "<pass>"
+ *   npm run push console http://<host>:3000
+ *   npm run push token <DEVICE_TOKEN>
+ *
+ * NVS is unencrypted, so these are recoverable from a flash dump. Acceptable for
+ * a device living on your own home network; it would not be for one carrying
+ * anybody else's credentials.
+ *
+ * THE RADIO IS TIED TO THE SCREEN. WiFi costs on the order of 80 mA, which would
+ * comfortably undo the sleep work — this thing already only manages eight hours.
+ * So the radio comes up when the screen does and goes down when it sleeps, which
+ * is a decent proxy for "is anyone using it". A capture that arrives before the
+ * join completes waits for it rather than failing.
+ */
+static Preferences prefs;
+static String netSsid, netPass, netConsole, netToken;
+static bool   online = false;
+
+static void netLoad() {
+  prefs.begin("net", true);
+  netSsid    = prefs.getString("ssid", "");
+  netPass    = prefs.getString("pass", "");
+  netConsole = prefs.getString("console", "");
+  netToken   = prefs.getString("token", "");
+  prefs.end();
+}
+
+static void netSave(const char *k, const String &v) {
+  prefs.begin("net", false);
+  prefs.putString(k, v);
+  prefs.end();
+}
+
+/* Start a join and return immediately. Waking the screen must not stall on the
+ * radio — a frozen UI while WiFi negotiates would be a worse bug than being
+ * briefly offline. loop() notices when it lands. */
+static void netKick() {
+  if (!netSsid.length() || WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(netSsid.c_str(), netPass.c_str());
+}
+
+static bool netConnect(uint32_t timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) { online = true; return true; }
+  if (!netSsid.length()) { LOGW("net", "no ssid stored — run: npm run push wifi"); return false; }
+
+  netKick();
+  const uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(120);
+
+  online = WiFi.status() == WL_CONNECTED;
+  if (online) LOGI("net", "%s  ip %s  rssi %d  in %lu ms", netSsid.c_str(),
+                   WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)(millis() - t0));
+  else        LOGW("net", "join failed for %s — the rest of the watch is unaffected", netSsid.c_str());
+  return online;
+}
+
+static void netSleep() {
+  if (!online && WiFi.getMode() == WIFI_OFF) return;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  online = false;
+  LOGI("net", "radio off with the screen");
 }
 
 /* ── CST820 touch, polled ─────────────────────────────────────────────────────
@@ -549,59 +624,185 @@ static void faceGesture(Gesture g) {
  * app does not capture audio and does not own a button — the shell hands it a
  * finished capture and a token stream, and it decides only how to draw them.
  */
-static void askPaintTokens() {
-  gfx->fillRect(PAD, BODY_Y + 96, BODY_W, BODY_H - 100, C_BG);
-  if (tokLen) drawWrapped(tokBuf, PAD, BODY_Y + 96, BODY_Y + BODY_H, RGB565_WHITE);
-  else        drawWrapped("no reply yet. hold BOOT, speak, release. tokens arrive over serial until phase 3 lands.",
-                          PAD, BODY_Y + 96, BODY_Y + BODY_H, C_FAINT);
-  tokDirty = false;
+/* Two selections and one button, exactly as specified — and no third control,
+ * because the direction is decided by the console from the detected language.
+ * Say the far-side language and it comes back in yours. A toggle would be one
+ * more thing to fumble mid-sentence. */
+struct Lang { const char *code; const char *label; };
+static const Lang LANGS[] = {
+  {"en", "English"},  {"ja", "Japanese"}, {"zh", "Chinese"},    {"ko", "Korean"},
+  {"es", "Spanish"},  {"fr", "French"},   {"de", "German"},     {"th", "Thai"},
+  {"vi", "Vietnamese"}, {"id", "Indonesian"}, {"ms", "Malay"},  {"ta", "Tamil"},
+};
+static constexpr int LANG_COUNT = sizeof(LANGS) / sizeof(LANGS[0]);
+static int langA = 0, langB = 1;                  // A = you, B = the other speaker
+
+static char     trStatusText[20] = "READY";
+static uint16_t trStatusColour   = C_OK;
+static char     trTranscript[200] = {0};
+static char     trTranslation[200] = {0};
+static char     trNote[72] = {0};
+
+static constexpr int16_t TR_ROW_H = 42;
+
+/* The built-in GFX font is ASCII. Japanese, Chinese, Korean and Thai would render
+ * as mojibake, which looks like a fault rather than a missing feature — so say so
+ * instead. The fix is to have the console rasterise the reply to a bitmap and blit
+ * it, which is the same trick the watch face already uses. */
+static bool renderable(const char *s) {
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) if (*p >= 0x80) return false;
+  return true;
 }
 
-static void askStatus(const char *s, uint16_t colour) {
-  gfx->fillRect(PAD, BODY_Y, BODY_W, 40, C_BG);
-  gfx->setTextSize(3); gfx->setTextColor(colour);
-  gfx->setCursor(PAD, BODY_Y + 4);
-  gfx->print(s);
-}
-
-static void askMeter(int32_t peak) {
-  gfx->fillRect(PAD, BODY_Y + 52, BODY_W, 24, C_BG);
-  gfx->drawRect(PAD, BODY_Y + 52, BODY_W, 24, C_CARD);
-  gfx->fillRect(PAD, BODY_Y + 80, BODY_W, 12, C_BG);
-  if (peak > 0) {
-    const float db = 20.0f * log10f((float)peak / 32767.0f);
-    float f = (db + 60.0f) / 60.0f;
-    if (f < 0) f = 0;
-    if (f > 1) f = 1;
-    const int16_t w = (int16_t)(f * (BODY_W - 2));
-    gfx->fillRect(PAD + 1, BODY_Y + 53, w, 22, f > 0.85f ? C_HOT : C_OK);
-    gfx->setTextSize(1); gfx->setTextColor(C_DIM);
-    gfx->setCursor(PAD + 2, BODY_Y + 80);
-    gfx->printf("peak %ld  %.0f dBFS", (long)peak, db);
-  } else {
-    gfx->setTextSize(1); gfx->setTextColor(C_WARN);
-    gfx->setCursor(PAD + 2, BODY_Y + 80);
-    gfx->print("no mic signal");
+static void trPaintRows() {
+  for (int i = 0; i < 2; i++) {
+    const int16_t y = BODY_Y + i * TR_ROW_H;
+    gfx->fillRoundRect(PAD, y, BODY_W, TR_ROW_H - 6, 6, C_CARD);
+    gfx->setTextSize(2);
+    gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD + 10, y + 10);
+    gfx->print(i == 0 ? "you " : "them");
+    gfx->setTextColor(RGB565_WHITE);
+    gfx->setCursor(PAD + 80, y + 10);
+    gfx->print(LANGS[i == 0 ? langA : langB].label);
   }
+}
+
+static void trPaintStatus() {
+  const int16_t y = BODY_Y + 2 * TR_ROW_H + 6;
+  gfx->fillRect(PAD, y, BODY_W, 30, C_BG);
+  gfx->setTextSize(3);
+  gfx->setTextColor(trStatusColour);
+  gfx->setCursor(PAD, y);
+  gfx->print(trStatusText);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(online ? C_OK : C_WARN);
+  gfx->setCursor(LCD_WIDTH - PAD - 60, y + 8);
+  gfx->print(online ? "online" : "offline");
+}
+
+static void trPaintText() {
+  const int16_t y = BODY_Y + 2 * TR_ROW_H + 44;
+  gfx->fillRect(PAD, y, BODY_W, BODY_Y + BODY_H - y, C_BG);
+  int16_t cy = y;
+  if (trTranscript[0]) {
+    drawWrapped(trTranscript, PAD, cy, y + 80, C_DIM);
+    cy += 84;
+  }
+  if (trTranslation[0]) {
+    if (renderable(trTranslation)) drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, RGB565_WHITE);
+    else                           drawWrapped("translation received — this script needs the host to rasterise it, see TODO",
+                                               PAD, cy, BODY_Y + BODY_H - 14, C_WARN);
+  } else if (trNote[0]) {
+    drawWrapped(trNote, PAD, cy, BODY_Y + BODY_H - 14, C_FAINT);
+  }
+}
+
+static void askStatus(const char *s, uint16_t colour) {   // kept: the shell calls this
+  snprintf(trStatusText, sizeof trStatusText, "%s", s);
+  trStatusColour = colour;
+  trPaintStatus();
 }
 
 static void askEnter() {
   clearBody();
-  askStatus(haveAudio ? "READY" : "NO AUDIO", haveAudio ? C_OK : C_HOT);
-  askMeter(lastPeak);
-  askPaintTokens();
+  trPaintRows();
+  if (!haveAudio) { snprintf(trStatusText, sizeof trStatusText, "NO AUDIO"); trStatusColour = C_HOT; }
+  trPaintStatus();
+  if (!trTranscript[0] && !trTranslation[0] && !trNote[0])
+    snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
+  trPaintText();
 }
-static void askTick(uint32_t) { if (tokDirty) askPaintTokens(); }
-static void askGesture(Gesture g) { if (g == G_TAP) { tokClear(); askPaintTokens(); } }
+
+static void askTick(uint32_t) {}
+
+/* Tap the top row to change your language, the second row to change theirs,
+ * anything below to clear the last result. */
+static void askGesture(Gesture g) {
+  if (g != G_TAP) return;
+  if (tapY < BODY_Y + TR_ROW_H)          langA = (langA + 1) % LANG_COUNT;
+  else if (tapY < BODY_Y + 2 * TR_ROW_H) langB = (langB + 1) % LANG_COUNT;
+  else {
+    trTranscript[0] = trTranslation[0] = 0;
+    snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
+    trPaintText();
+    return;
+  }
+  LOGI("translate", "pair %s-%s", LANGS[langA].code, LANGS[langB].code);
+  trPaintRows();
+}
+
+/* Pull one JSON string field out without dragging in a parser. The device only
+ * ever talks to our own endpoint, whose shape is fixed in the same repo. */
+static bool jsonField(const String &src, const char *name, char *out, size_t cap) {
+  String needle = String("\"") + name + "\":\"";
+  const int i = src.indexOf(needle);
+  if (i < 0) return false;
+  const int s = i + needle.length();
+  const int e = src.indexOf('"', s);
+  if (e < 0) return false;
+  const String v = src.substring(s, e);
+  snprintf(out, cap, "%s", v.c_str());
+  return true;
+}
+
 static void askCapture(float secs) {
-  askStatus("SENT", C_COOL);
-  askMeter(lastPeak);
-  gfx->setTextSize(1); gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD + 200, BODY_Y + 80);
-  gfx->printf("%.1f s captured", secs);
-  // Where a transport will go. Until phase 3, the host answers over serial.
-  LOGI("ask", "capture ready: %.2f s, %u samples, peak %ld",
-       secs, (unsigned)recorded, (long)lastPeak);
+  askStatus("SENDING", C_COOL);
+  trTranscript[0] = trTranslation[0] = 0;
+  snprintf(trNote, sizeof trNote, "%.1f s uploading...", secs);
+  trPaintText();
+
+  if (!netConsole.length()) {
+    askStatus("NO HOST", C_HOT);
+    snprintf(trNote, sizeof trNote, "npm run push console http://host:3000");
+    trPaintText();
+    return;
+  }
+  // The join may still be in flight if the button was pressed the instant the
+  // screen woke, so wait for it here rather than failing the capture.
+  if (!netConnect(8000)) {
+    askStatus("OFFLINE", C_HOT);
+    snprintf(trNote, sizeof trNote, "no wifi — npm run push wifi");
+    trPaintText();
+    return;
+  }
+
+  const uint32_t t0 = millis();
+  String url = netConsole + "/api/translate?pair=" + LANGS[langA].code + "-"
+             + LANGS[langB].code + "&channels=2";
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/octet-stream");
+  if (netToken.length()) http.addHeader("Authorization", String("Bearer ") + netToken);
+
+  const int code = http.POST((uint8_t *)buffer, recorded * sizeof(int16_t));
+  const String body = code > 0 ? http.getString() : String();
+  http.end();
+
+  if (code != 200) {
+    askStatus("ERROR", C_HOT);
+    snprintf(trNote, sizeof trNote, "console said %d", code);
+    trPaintText();
+    LOGE("translate", "POST %s -> %d", url.c_str(), code);
+    return;
+  }
+
+  jsonField(body, "transcript", trTranscript, sizeof trTranscript);
+  jsonField(body, "translation", trTranslation, sizeof trTranslation);
+  char target[8] = {0};
+  jsonField(body, "target", target, sizeof target);
+
+  if (!trTranscript[0]) {
+    askStatus("SILENT", C_WARN);
+    snprintf(trNote, sizeof trNote, "nothing heard — check the mic");
+  } else {
+    askStatus("READY", C_OK);
+    trNote[0] = 0;
+  }
+  trPaintText();
+  LOGI("translate", "%.1f s -> %s (%lu ms) \"%s\"", secs, target,
+       (unsigned long)(millis() - t0), trTranscript);
 }
 
 /* ── app: system ──────────────────────────────────────────────────────────── */
@@ -646,7 +847,7 @@ static void sysTick(uint32_t now) {
  * the id is a stable key, the meaning is allowed to move. */
 static App APPS[] = {
   { "app.clock",  "Face",   "tap for the photo",         faceEnter,  faceTick,  faceGesture, nullptr,    true  },
-  { "app.ask",    "Ask",    "hold BOOT \xB7 tap clears", askEnter,   askTick,   askGesture,  askCapture, false },
+  { "app.ask",    "Translate", "hold BOOT \xB7 tap a row",  askEnter, askTick, askGesture, askCapture, false },
   { "app.system", "System", "swipe down for settings",   sysEnter,   sysTick,   nullptr,     nullptr,    false },
 };
 static constexpr int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
@@ -721,6 +922,7 @@ static void wakeScreen() {
     // A watch wakes to its face, not to wherever you last left it. Apps are
     // somewhere you go; the face is where the device lives.
     enterApp(0);
+    netKick();          // radio follows the screen; non-blocking on purpose
     LOGI("pwr", "awake");
   }
   noteActivity();
@@ -741,6 +943,7 @@ static void powerTick(uint32_t now) {
     // and the AMOLED keeps drawing current. displayOff() is the part that saves
     // the battery.
     gfx->displayOff();
+    netSleep();         // ~80 mA of radio is not worth leaving on for nobody
     LOGI("pwr", "screen off after %lu ms idle", (unsigned long)idle);
   }
 }
@@ -750,6 +953,7 @@ static void lockNow() {
   powerState = PWR_OFF;
   gfx->setBrightness(0);
   gfx->displayOff();
+  netSleep();
   LOGI("pwr", "locked");
 }
 
@@ -965,6 +1169,52 @@ static void handleCommand(char *line) {
     if (offAfterMs && dimAfterMs > offAfterMs / 2) dimAfterMs = offAfterMs / 2;
     LOGI("pwr", "sleep after %ld s", s);
   }
+  else if (!strncmp(line, ">wifi ", 6)) {
+    /* Split on the LAST space, so an SSID containing spaces still works while the
+     * password (which must not contain one) stays intact. */
+    char *arg = line + 6, *sp = strrchr(arg, ' ');
+    if (!sp) { LOGW("cmd", "usage: >wifi <ssid> <password>"); return; }
+    *sp = 0;
+    netSsid = arg; netPass = sp + 1;
+    netSave("ssid", netSsid); netSave("pass", netPass);
+    // Length only. Never log the password itself — this line ends up in the
+    // console's log store and in git-adjacent places.
+    LOGI("net", "stored ssid %s, password %u chars", netSsid.c_str(), netPass.length());
+    netConnect(12000);
+    if (powerState != PWR_OFF && !qsOpen && appIndex == 1) trPaintStatus();
+  }
+  else if (!strncmp(line, ">console ", 9)) {
+    netConsole = line + 9; netSave("console", netConsole);
+    LOGI("net", "console %s", netConsole.c_str());
+  }
+  else if (!strncmp(line, ">token ", 7)) {
+    netToken = line + 7; netSave("token", netToken);
+    LOGI("net", "device token stored, %u chars", netToken.length());
+  }
+  else if (!strcmp(line, ">ping")) {
+    /* Proves the whole device→console path — radio, URL, routing, firewall and
+     * token — without needing anyone to hold the button and speak. On Windows the
+     * usual failure is the host firewall silently dropping inbound 3000. */
+    if (!netConsole.length()) { LOGW("net", "no console url — npm run push console"); return; }
+    if (!netConnect(8000))    { LOGW("net", "offline — cannot ping"); return; }
+    HTTPClient http;
+    http.begin(netConsole + "/api/features");
+    if (netToken.length()) http.addHeader("Authorization", String("Bearer ") + netToken);
+    const uint32_t t0 = millis();
+    const int code = http.GET();
+    const int len  = http.getSize();
+    http.end();
+    if (code == 200) LOGI("net", "console reachable: %d, %d bytes, %lu ms",
+                          code, len, (unsigned long)(millis() - t0));
+    else             LOGE("net", "console unreachable: %d — host firewall on port 3000?", code);
+  }
+  else if (!strcmp(line, ">net")) {
+    LOGI("net", "ssid=%s console=%s token=%s state=%s",
+         netSsid.length() ? netSsid.c_str() : "(none)",
+         netConsole.length() ? netConsole.c_str() : "(none)",
+         netToken.length() ? "set" : "(none)", online ? "online" : "offline");
+    if (online) LOGI("net", "ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  }
   else if (!strncmp(line, ">face ", 6)) {
     faceLoad(atoi(line + 6));
     if (powerState != PWR_OFF) enterApp(0);
@@ -1068,6 +1318,10 @@ void setup() {
   pmicIrqPeek();
   faceLoad(0);          // before the first paint, so the face can use its photo
 
+  netLoad();
+  if (netSsid.length()) { LOGI("net", "joining %s", netSsid.c_str()); netKick(); }
+  else                  LOGI("net", "no credentials — npm run push wifi \"<ssid>\" \"<pass>\"");
+
   enterApp(0);
   noteActivity();
   LOGI("shell", "ready — tap locks, double tap changes app, hold talks, swipe down for settings");
@@ -1121,6 +1375,21 @@ void loop() {
       enterApp(appIndex - 1);
     } else if (APPS[appIndex].onGesture) {
       APPS[appIndex].onGesture(g);
+    }
+  }
+
+  /* Notice the radio arriving or leaving. netKick() starts joins without waiting,
+   * so this is where `online` actually becomes true. */
+  static uint32_t lastNet = 0;
+  static bool     netWas = false;
+  if (now - lastNet > 1000) {
+    lastNet = now;
+    online = WiFi.status() == WL_CONNECTED;
+    if (online != netWas) {
+      netWas = online;
+      if (online) LOGI("net", "online, ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      else        LOGW("net", "offline");
+      if (!qsOpen && appIndex == 1) trPaintStatus();
     }
   }
 

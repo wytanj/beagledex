@@ -17,11 +17,40 @@ because on this board's native USB-Serial/JTAG bridge RTS drives EN — the very
 trick monitor.py uses deliberately. Here it would reboot the app we are trying to
 talk to, so it is suppressed.
 """
+import socket
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import serial
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_env():
+    """Read .env so `push wifi` needs no arguments and no password on the command
+    line — shell history is a bad place for one."""
+    out = {}
+    p = ROOT / ".env"
+    if p.is_file():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+def lan_ip():
+    """The address the device must use — 'localhost' means the watch itself.
+    A UDP connect() sends no packets, so this works out the route locally."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
 
 # Same reason as serial-log.py: cp1252 stdout under Git Bash cannot encode the
 # arrows used below, and the device's replies contain em dashes.
@@ -47,6 +76,27 @@ elif verb == "tok":
     cmd = ">tok " + rest
 elif verb == "clear":
     cmd = ">clear"
+elif verb == "wifi":
+    env = load_env()
+    if rest:
+        cmd = ">wifi " + rest
+    else:
+        ssid = env.get("HOME_WIFI_SSID")
+        pw = env.get("HOME_WIFI_PASSWORD")
+        if not ssid or not pw:
+            raise SystemExit("set HOME_WIFI_SSID and HOME_WIFI_PASSWORD in .env, or pass them")
+        cmd = f">wifi {ssid} {pw}"
+        print(f"(ssid {ssid}, password {len(pw)} chars from .env)")
+elif verb == "console":
+    url = rest or f"http://{lan_ip()}:3000"
+    cmd = ">console " + url
+elif verb == "token":
+    tok = rest or load_env().get("DEVICE_TOKEN", "")
+    if not tok:
+        raise SystemExit("set DEVICE_TOKEN in .env, or pass it")
+    cmd = ">token " + tok
+elif verb == "net":
+    cmd = ">net"
 elif verb == "raw":
     cmd = rest
 else:
@@ -62,7 +112,14 @@ s.dtr = False          # set BEFORE open, or Windows asserts them and resets the
 s.rts = False
 s.open()
 
-print(f"→ {cmd}", flush=True)
+# Never echo a credential. These commands are typed at a terminal whose history is
+# kept, and the reply below gets copied into logs.
+if verb == "wifi":
+    print("→ >wifi <ssid> <password>", flush=True)
+elif verb == "token":
+    print("→ >token <token>", flush=True)
+else:
+    print(f"→ {cmd}", flush=True)
 s.write((cmd + "\n").encode("utf-8"))
 s.flush()
 
