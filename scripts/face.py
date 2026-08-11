@@ -56,6 +56,13 @@ PIX_OFFSET = 0x1000
 MAGIC = 0x31434657          # 'WFC1' read back little-endian
 FMT_RGB565_LE = 0
 
+# Home mascot: a small pixelated image the watch draws below the clock. Its own
+# header ('WFA1') and its own region in the storage partition (slot 2), so it is
+# independent of the full-screen face in slot 0.
+ART_MAGIC = 0x31414657      # 'WFA1'
+ART_SLOT = 2
+ART_ADDR = STORAGE_BASE + ART_SLOT * SLOT_STRIDE
+
 # FIELDS — keep in lockstep with faceLoad() in firmware/watch/watch.ino
 #   0x00 u32 magic      0x0C u32 pixelBytes   0x18 u8  timeSize
 #   0x04 u16 width      0x10 u32 crc32        0x19 u8  reserved
@@ -92,6 +99,28 @@ def pack_pixels(img):
         out[j] = v & 0xFF
         out[j + 1] = v >> 8
     return bytes(out)
+
+
+def pixelate(img, pixels, size, crop_y):
+    """Square-crop (biased vertically toward the subject), downscale to a small
+    grid, then nearest-upscale back — the classic pixelation. Averaging on the way
+    down (LANCZOS) keeps colours true; NEAREST on the way up makes the blocks."""
+    side = min(img.width, img.height)
+    cx = img.width // 2
+    cy = int(img.height * crop_y)
+    left = max(0, min(img.width - side, cx - side // 2))
+    top = max(0, min(img.height - side, cy - side // 2))
+    sq = img.crop((left, top, left + side, top + side)).convert("RGB")
+    small = sq.resize((pixels, pixels), Image.LANCZOS)
+    return small.resize((size, size), Image.NEAREST)
+
+
+def build_art_blob(img):
+    pix = pack_pixels(img)
+    hdr = struct.pack("<IHHII", ART_MAGIC, img.width, img.height, len(pix),
+                      zlib.crc32(pix) & 0xFFFFFFFF)          # 16 bytes
+    assert len(hdr) == 16
+    return hdr + b"\x00" * (PIX_OFFSET - len(hdr)) + pix
 
 
 def build_blob(pixels, w, h, time_x, time_y, time_size, time_colour, show_date, hold_ms):
@@ -137,11 +166,15 @@ def esptool_write(path, addr, port):
 
 def main():
     ap = argparse.ArgumentParser(description="watch face builder")
-    ap.add_argument("action", choices=["build", "write", "test", "preview", "clear"])
+    ap.add_argument("action", choices=["build", "write", "test", "preview", "clear", "art"])
     ap.add_argument("image", nargs="?")
     ap.add_argument("-o", "--out")
     ap.add_argument("--slot", type=int, default=0)
     ap.add_argument("--port", default="COM3")
+    ap.add_argument("--pixels", type=int, default=50, help="art: pixelation grid (blocks per side)")
+    ap.add_argument("--size", type=int, default=200, help="art: on-screen size in px")
+    ap.add_argument("--crop-y", type=float, default=0.5, help="art: 0..1 vertical crop centre")
+    ap.add_argument("--flash", action="store_true", help="art: write to the device (else preview only)")
     ap.add_argument("--time-x", type=int, default=40)
     ap.add_argument("--time-y", type=int, default=180)
     ap.add_argument("--time-size", type=int, default=7)
@@ -150,6 +183,26 @@ def main():
     ap.add_argument("--hold-ms", type=int, default=3000,
                     help="how long the photo shows on wake before the dark face")
     args = ap.parse_args()
+
+    if args.action == "art":
+        if not args.image:
+            sys.exit("need an image path")
+        art = pixelate(Image.open(args.image), args.pixels, args.size, args.crop_y)
+        # Always write a preview PNG so the look can be judged before flashing.
+        prev = ROOT / "firmware" / "home-art.png"
+        art.save(prev)
+        blob = build_art_blob(art)
+        out = ROOT / "firmware" / "home-art.bin"
+        out.write_bytes(blob)
+        print(f"art {art.width}x{art.height} ({args.pixels}px grid) -> {prev.name}, {len(blob)} bytes")
+        print(f"  target {ART_ADDR:#x} (storage slot {ART_SLOT})")
+        if args.flash:
+            if not esptool_write(out, ART_ADDR, args.port):
+                sys.exit("esptool write failed")
+            print("written. reboot to see it below the clock.")
+        else:
+            print("preview only — add --flash to write it to the device.")
+        return
 
     if args.action == "clear":
         """Zero the descriptor only. The firmware validates the magic before it

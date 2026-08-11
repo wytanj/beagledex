@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.20.0";
+static const char *FW_VERSION = "0.21.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -659,26 +659,53 @@ static void faceLoad(int slot) {
        slot, w, ht, tx, ty, face.timeSize, face.holdMs);
 }
 
-enum FaceMode : uint8_t { FACE_PHOTO, FACE_DARK };
-static FaceMode faceMode    = FACE_DARK;
+/* ── home mascot ──────────────────────────────────────────────────────────────
+ * A small pixelated image drawn below the clock on the home face. Own header
+ * ('WFA1') and own region (storage slot 2), independent of the full-screen face
+ * in slot 0. scripts/face.py art builds and flashes it. */
+static constexpr uint32_t ART_MAGIC = 0x31414657;         // 'WFA1'
+static constexpr uint32_t ART_BASE  = 2 * FACE_STRIDE;    // slot 2 within storage
+static const uint16_t             *artPix = nullptr;
+static uint16_t                    artW = 0, artH = 0;
+static esp_partition_mmap_handle_t artMap = 0;
+
+static void artLoad() {
+  const esp_partition_t *p = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+  if (!p) return;
+  uint8_t h[16];
+  if (esp_partition_read(p, ART_BASE, h, sizeof h) != ESP_OK) return;
+  uint32_t magic, pixBytes; uint16_t w, ht;
+  memcpy(&magic, h, 4);
+  if (magic != ART_MAGIC) { LOGI("art", "no home mascot"); return; }
+  memcpy(&w, h + 4, 2); memcpy(&ht, h + 6, 2); memcpy(&pixBytes, h + 8, 4);
+  if (!w || !ht || w > LCD_WIDTH || ht > LCD_HEIGHT || pixBytes != (uint32_t)w * ht * 2) {
+    LOGW("art", "implausible %ux%u — skipped", w, ht); return;
+  }
+  const void *ptr = nullptr;
+  if (esp_partition_mmap(p, ART_BASE + FACE_PIX_OFF, pixBytes,
+                         ESP_PARTITION_MMAP_DATA, &ptr, &artMap) != ESP_OK) return;
+  artPix = (const uint16_t *)ptr; artW = w; artH = ht;
+  LOGI("art", "home mascot %ux%u mapped", w, ht);
+}
+
+/* Home layout: clock near the top, mascot centred below it. */
+static constexpr int16_t HOME_CLK_X = 28, HOME_CLK_Y = 26, HOME_CLK_SZ = 6;
+
+enum FaceMode : uint8_t { FACE_PHOTO, FACE_HOME };
+static FaceMode faceMode    = FACE_HOME;
 static uint32_t faceSince   = 0;
 static uint8_t  faceLastMin = 255;
 
+/* Photo-mode clock, positioned by the face descriptor (used only under a full
+ * photo). */
 static void faceDrawTime() {
   const int16_t ch = 8 * face.timeSize;
-  // In dark mode the background is flat, so clear just the text block. In photo
-  // mode the whole photo is re-blitted by the caller instead — cheaper to reason
-  // about than a sub-rectangle restore, and it happens at most once a minute
-  // during the few seconds the photo is even up.
-  if (faceMode == FACE_DARK)
-    gfx->fillRect(face.timeX, face.timeY, 6 * face.timeSize * 5 + 6, ch + 28, C_BG);
-
   gfx->setTextSize(face.timeSize);
   gfx->setTextColor(face.timeColour);
   gfx->setCursor(face.timeX, face.timeY);
   if (rtc.valid) gfx->printf("%02u:%02u", rtc.hour, rtc.min);
   else           gfx->print("--:--");
-
   if (face.showDate) {
     gfx->setTextSize(2);
     gfx->setTextColor(rtc.valid ? C_DIM : C_WARN);
@@ -688,36 +715,62 @@ static void faceDrawTime() {
   }
 }
 
+/* Home clock + date, cleared in place so the mascot below is never touched. */
+static void homeClock() {
+  const int16_t sz = HOME_CLK_SZ, ch = 8 * sz;
+  gfx->fillRect(HOME_CLK_X, HOME_CLK_Y, 6 * sz * 5 + 8, ch + 2, C_BG);
+  gfx->setTextSize(sz); gfx->setTextColor(C_ACCENT);
+  gfx->setCursor(HOME_CLK_X, HOME_CLK_Y);
+  if (rtc.valid) gfx->printf("%02u:%02u", rtc.hour, rtc.min);
+  else           gfx->print("--:--");
+  gfx->fillRect(HOME_CLK_X, HOME_CLK_Y + ch + 8, 224, 18, C_BG);
+  gfx->setTextSize(2); gfx->setTextColor(rtc.valid ? C_DIM : C_WARN);
+  gfx->setCursor(HOME_CLK_X + 2, HOME_CLK_Y + ch + 8);
+  if (rtc.valid) gfx->printf("%04u-%02u-%02u", rtc.year, rtc.mon, rtc.day);
+  else           gfx->print("npm run push time");
+}
+
+static void homeArt() {
+  if (!artPix) return;
+  const int16_t ax = (LCD_WIDTH - artW) / 2;
+  const int16_t ay = HOME_CLK_Y + 8 * HOME_CLK_SZ + 40;
+  gfx->draw16bitRGBBitmap(ax, ay, (uint16_t *)artPix, artW, artH);
+}
+
 static void faceEnter() {
   if (facePix) {
     faceMode  = FACE_PHOTO;
     faceSince = millis();
     gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)facePix, face.w, face.h);
+    faceDrawTime();
   } else {
-    faceMode = FACE_DARK;
+    faceMode = FACE_HOME;
     gfx->fillScreen(C_BG);
+    homeClock();
+    homeArt();
   }
-  faceDrawTime();
   faceLastMin = rtc.min;
 }
 
 static void faceTick(uint32_t now) {
+  // A full photo (if set) gives way to the home face after its hold.
   if (faceMode == FACE_PHOTO && facePix && now - faceSince > face.holdMs) {
-    faceMode = FACE_DARK;
-    gfx->fillScreen(C_BG);              // drop the expensive pixels
-    faceDrawTime();
+    faceMode = FACE_HOME;
+    gfx->fillScreen(C_BG);
+    homeClock();
+    homeArt();
     faceLastMin = rtc.min;
     return;
   }
   if (rtc.min != faceLastMin) {
     faceLastMin = rtc.min;
-    if (faceMode == FACE_PHOTO) gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)facePix, face.w, face.h);
-    faceDrawTime();
+    if (faceMode == FACE_PHOTO) { gfx->draw16bitRGBBitmap(0, 0, (uint16_t *)facePix, face.w, face.h); faceDrawTime(); }
+    else                        homeClock();   // mascot persists; only the clock repaints
   }
 }
 
 static void faceGesture(Gesture g) {
-  if (g == G_TAP && facePix) faceEnter();   // show me the dog again
+  if (g == G_TAP && facePix) faceEnter();   // re-show a full photo, if one is set
 }
 
 /* ── app: ask (the PTT → LLM primitive) ───────────────────────────────────────
@@ -1903,6 +1956,7 @@ void setup() {
   LOGI("rtc", "%s", rtc.valid ? "time is set" : "not set — run npm run push time");
   pmicIrqPeek();
   faceLoad(0);          // before the first paint, so the face can use its photo
+  artLoad();            // the home mascot below the clock
 
   netLoad();
   if (netCount) { LOGI("net", "%d network(s) stored — warming %s", netCount, nets[netLast].ssid.c_str()); netKick(); }
