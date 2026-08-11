@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.17.2";
+static const char *FW_VERSION = "0.18.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -221,6 +221,7 @@ static size_t cacheGet(const char *key, uint8_t *out, size_t cap) {
  * join completes waits for it.
  */
 static Preferences prefs;
+static int provider = 0;              // Translate engine: 0 grok, 1 gemini (see Translate app)
 static constexpr int NET_MAX = 4;
 struct WifiNet { String ssid, pass; };
 static WifiNet nets[NET_MAX];
@@ -261,9 +262,16 @@ static void netLoad() {
   }
   netConsole = prefs.getString("console", "");
   netToken   = prefs.getString("token", "");
+  provider   = prefs.getInt("provider", 0);   // Translate's engine toggle
   prefs.end();
   if (netCount) netPersist();          // write back a migrated legacy network
   multiRebuild();
+}
+
+static void saveProvider() {           // called from the Translate app
+  prefs.begin("net", false);
+  prefs.putInt("provider", provider);
+  prefs.end();
 }
 
 static void netSave(const char *k, const String &v) {
@@ -737,6 +745,12 @@ static const char *langLabel(const char *code) {
 
 static char     trStatusText[20] = "READY";
 static uint16_t trStatusColour   = C_OK;
+
+/* Which understanding engine the console should use. A per-app toggle purely to
+ * A/B real-world latency — tap the status band to switch. `provider` is declared
+ * up with the net globals so netLoad() can restore it; persisted via
+ * saveProvider() so a reboot mid-comparison doesn't reset it. */
+static const char *PROVIDERS[] = { "grok", "gemini" };
 static char     trTranscript[200] = {0};
 static char     trTranslation[200] = {0};
 static char     trNote[72] = {0};
@@ -819,10 +833,14 @@ static void trPaintStatus() {
   gfx->setCursor(PAD, y);
   gfx->print(trStatusText);
 
+  // Right side, stacked: online state, and the engine (tap the band to switch).
   gfx->setTextSize(1);
   gfx->setTextColor(online ? C_OK : C_WARN);
-  gfx->setCursor(LCD_WIDTH - PAD - 60, y + 8);
+  gfx->setCursor(LCD_WIDTH - PAD - 60, y);
   gfx->print(online ? "online" : "offline");
+  gfx->setTextColor(C_ACCENT);
+  gfx->setCursor(LCD_WIDTH - PAD - 60, y + 14);
+  gfx->printf("engine:%s", PROVIDERS[provider]);
 }
 
 static void trPaintText() {
@@ -884,10 +902,16 @@ static void askGesture(Gesture g) {
     return;
   }
 
-  // main view: a card opens its picker; a tap below clears the last result
+  // main view: a card opens its picker; the status band toggles the engine; a tap
+  // in the result area below clears the last result.
   if (tapY < BODY_Y + TR_ROW_H)          { pickerFor = 0; askEnter(); }
   else if (tapY < BODY_Y + 2 * TR_ROW_H) { pickerFor = 1; askEnter(); }
-  else {
+  else if (tapY < TR_TEXT_Y) {                        // the status band
+    provider = (provider + 1) % (int)(sizeof(PROVIDERS) / sizeof(PROVIDERS[0]));
+    saveProvider();
+    LOGI("translate", "engine %s", PROVIDERS[provider]);
+    trPaintStatus();
+  } else {
     trTranscript[0] = trTranslation[0] = 0;
     snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
     trPaintText();
@@ -1003,7 +1027,7 @@ static void askCapture(float secs) {
 
   const uint32_t t0 = millis();
   String url = netConsole + "/api/translate?pair=" + LANGS[langA].code + "-"
-             + LANGS[langB].code + "&channels=2&speak=1";
+             + LANGS[langB].code + "&channels=2&speak=1&provider=" + PROVIDERS[provider];
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/octet-stream");
@@ -1012,8 +1036,8 @@ static void askCapture(float secs) {
   /* The reply text rides in headers, so we never parse a body we are about to
    * play. Ask HTTPClient to keep the ones we need. */
   static const char *keep[] = { "X-Transcript", "X-Translation", "X-Target",
-                                "X-Audio-Format", "X-Audio-Error", "X-Text-W", "X-Text-H" };
-  http.collectHeaders(keep, 7);
+                                "X-Audio-Format", "X-Audio-Error", "X-Text-W", "X-Text-H", "X-Error" };
+  http.collectHeaders(keep, 8);
 
   /* The default 5 s covers none of this: a capture is a few hundred KB up, then
    * the console spends ~1.5 s on STT and translate and another ~1 s synthesising
@@ -1028,11 +1052,16 @@ static void askCapture(float secs) {
   lastSentBytes = sent;
 
   if (code != 200) {
+    // The console explains provider/key failures in X-Error; show that rather than
+    // a bare number, so "gemini key not set" doesn't look like a dead mic.
+    char err[80] = {0};
+    urlDecode(http.header("X-Error"), err, sizeof err);
     http.end();
     askStatus("ERROR", C_HOT);
-    snprintf(trNote, sizeof trNote, "console said %d", code);
+    if (err[0]) snprintf(trNote, sizeof trNote, "%s", err);
+    else        snprintf(trNote, sizeof trNote, "console said %d", code);
     trPaintText();
-    LOGE("translate", "POST %s -> %d", url.c_str(), code);
+    LOGE("translate", "POST -> %d (%s)", code, err[0] ? err : "?");
     return;
   }
 

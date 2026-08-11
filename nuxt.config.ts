@@ -18,6 +18,8 @@ export default defineNuxtConfig({
     // Set XAI_API_KEY in .env. Never shipped to the device — /api/translate holds
     // the credential and the device only ever sends audio and renders text.
     xaiApiKey: '',
+    // Optional second provider for the translate understanding leg (?provider=gemini).
+    geminiApiKey: '',
   },
 
   devServer: { host: '0.0.0.0', port: 3000 },

@@ -204,6 +204,28 @@ or phone change:
 5. **Cache repeated replies** (SD card, hashed by text). "Done" / "all healthy"
    replay at zero cost.
 
+### Provider adapter (built for translate; extend to the agent)
+
+`/api/translate` is now provider-agnostic: `?provider=grok|gemini` selects the
+understanding engine, behind one `Understanding` shape in `server/utils/understand.ts`.
+The Translate app toggles it live (tap the status band) so real-world latency can be
+compared on the actual device — that was the point. TTS stays one implementation for
+both, so a head-to-head isolates the understanding leg.
+
+- **grok (xAI)**: two calls — STT then chat. Proven.
+- **gemini**: one call — Gemini takes audio natively, so transcribe + detect +
+  translate happen together. Cheaper per unit (audio in ~$0.30/M on Flash-Lite vs
+  xAI STT $0.10/hr *plus* a chat call) and a round trip shorter. Written to the
+  documented `generateContent` format; **verify once a GEMINI_API_KEY exists** — it
+  fails cleanly with an X-Error until then.
+
+Why this matters beyond translate: the agent app should reuse the same adapter. And
+Gemini's **function calling** fits voice-command routing unusually well — audio →
+structured tool call to the MCP in a single call. Note the free-tier caveat:
+free-tier "context [is] used to improve our products", so for backend/ops commands
+use the paid tier or keep STT local. Translation on free tier is a fair trade;
+infra commands are not.
+
 ### Build order when resumed
 
 1. `/api/agent`: STT → forward text to the agent/MCP endpoint → condense with the
