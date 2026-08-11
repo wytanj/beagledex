@@ -50,7 +50,9 @@ export default defineEventHandler(async (event) => {
   const pcmSeconds = container ? 0 : +(mono.length / 32000).toFixed(2)
 
   const xaiKey = cfg.xaiApiKey || process.env.XAI_API_KEY
-  const geminiKey = cfg.geminiApiKey || process.env.GEMINI_API_KEY
+  // Accept GEMINI_KEY as well as the documented GEMINI_API_KEY — forgiving beats a
+  // silent "why is it still 501".
+  const geminiKey = cfg.geminiApiKey || process.env.GEMINI_API_KEY || process.env.GEMINI_KEY
 
   /* One clear failure path for a missing key or a provider error, surfaced to the
    * device in an X-Error header it can show — far better than the old "SILENT",

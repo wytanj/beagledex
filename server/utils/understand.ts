@@ -104,7 +104,9 @@ function wavMono16k(pcm: Buffer): Buffer {
 }
 
 export async function understandGemini(a: Audio, o: UnderstandOpts): Promise<Understanding> {
-  const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash-lite'
+  // An alias, not a pinned version: the cheapest current tier, and it won't 404
+  // when Google retires a numbered model for new keys (which 2.5-flash-lite did).
+  const model = process.env.GEMINI_MODEL ?? 'gemini-flash-lite-latest'
   const audio = a.isPcm ? wavMono16k(a.bytes) : a.bytes
   const mime = a.isPcm ? 'audio/wav' : a.mime
 
