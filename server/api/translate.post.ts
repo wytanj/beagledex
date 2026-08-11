@@ -162,8 +162,10 @@ export default defineEventHandler(async (event) => {
             + `${languageName(fromCode)} speaker and a ${languageName(toCode)} speaker. `
             + `Translate the user's words into natural, spoken `
             + `${languageName(targetCode)}. Reply with the translation only — no notes, `
-            + `no romanisation, no quotation marks. If the input is not meaningful `
-            + `speech, reply with an empty string.`,
+            + `no romanisation, no quotation marks, no commentary. Always translate `
+            + `what you were given, even a single word or an incomplete fragment. `
+            + `Never answer the speaker, never explain, and never reply with nothing: `
+            + `an empty reply looks to the user like the microphone failed.`,
         },
         { role: 'user', content: transcript },
       ],

@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.11.0";
+static const char *FW_VERSION = "0.11.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -706,9 +706,17 @@ static void trPaintText() {
     cy += 84;
   }
   if (trTranslation[0]) {
-    if (renderable(trTranslation)) drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
-    else                           drawWrapped("translation received — this script needs the host to rasterise it, see TODO",
-                                               PAD, cy, BODY_Y + BODY_H - 14, C_WARN);
+    if (renderable(trTranslation)) {
+      drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
+    } else {
+      /* The translation arrived and is correct — it just uses a script the built-in
+       * ASCII font has no glyphs for. Say that it worked and how many bytes came
+       * back, because "needs rasterising" alone reads like a failure. */
+      char note[80];
+      snprintf(note, sizeof note, "OK: %u bytes of %s. This script needs host rendering.",
+               (unsigned)strlen(trTranslation), LANGS[langB].label);
+      drawWrapped(note, PAD, cy, BODY_Y + BODY_H - 14, C_WARN);
+    }
   } else if (trNote[0]) {
     drawWrapped(trNote, PAD, cy, BODY_Y + BODY_H - 14, C_FAINT);
   }
@@ -763,8 +771,20 @@ static bool jsonField(const String &src, const char *name, char *out, size_t cap
 }
 
 static void askCapture(float secs) {
-  askStatus("SENDING", C_COOL);
   trTranscript[0] = trTranslation[0] = 0;
+
+  /* Distinguish "you let go too early" from "the microphone heard nothing". Both
+   * used to say SILENT, which sent me hunting a hardware fault that did not
+   * exist — the capture was simply 0.45 s long. Cheaper than a round trip, too. */
+  if (secs < 0.6f) {
+    askStatus("TOO SHORT", C_WARN);
+    snprintf(trNote, sizeof trNote, "keep holding BOOT while you speak (%.1f s)", secs);
+    trPaintText();
+    LOGW("translate", "capture only %.2f s — not sent", secs);
+    return;
+  }
+
+  askStatus("SENDING", C_COOL);
   snprintf(trNote, sizeof trNote, "%.1f s uploading...", secs);
   trPaintText();
 
@@ -1161,7 +1181,9 @@ static void doVoiceCapture() {
  * not depend on the touch panel working.
  */
 static constexpr uint32_t BTN_DEBOUNCE_MS = 25;
-static constexpr uint32_t BTN_HOLD_MS     = 600;
+/* 400 ms, not 600: capture used to start so late that a natural press-and-speak
+ * released before much audio existed. Still comfortably longer than a tap. */
+static constexpr uint32_t BTN_HOLD_MS     = 400;
 static constexpr uint32_t BTN_DOUBLE_MS   = 320;
 
 static bool     btnDown = false, btnHoldFired = false, btnTapPending = false;
