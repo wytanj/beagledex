@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.11.1";
+static const char *FW_VERSION = "0.12.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -658,6 +658,12 @@ static char     trTranscript[200] = {0};
 static char     trTranslation[200] = {0};
 static char     trNote[72] = {0};
 
+/* Last HTTP outcome, kept for `>last`. */
+static int      lastHttpCode  = 0;
+static size_t   lastSentBytes = 0;
+static size_t   lastBodyLen   = 0;
+static char     lastBodyHead[120] = {0};
+
 static constexpr int16_t TR_ROW_H = 42;
 
 /* The built-in GFX font is ASCII. Japanese, Chinese, Korean and Thai would render
@@ -758,15 +764,29 @@ static void askGesture(Gesture g) {
 
 /* Pull one JSON string field out without dragging in a parser. The device only
  * ever talks to our own endpoint, whose shape is fixed in the same repo. */
+/* Tolerate whitespace around the colon. The strict form `"name":"` cost an
+ * embarrassing amount of debugging: Nitro pretty-prints JSON in dev, so the wire
+ * actually carries `"transcript": "…"` with a space, the match failed, and an
+ * empty transcript is indistinguishable from silence — so a working pipeline
+ * reported a dead microphone. Worse, the strict version would have started
+ * working in production, where the JSON is compact. */
 static bool jsonField(const String &src, const char *name, char *out, size_t cap) {
-  String needle = String("\"") + name + "\":\"";
-  const int i = src.indexOf(needle);
+  const String key = String("\"") + name + "\"";
+  const int len = (int)src.length();
+  int i = src.indexOf(key);
   if (i < 0) return false;
-  const int s = i + needle.length();
-  const int e = src.indexOf('"', s);
+  i += (int)key.length();
+
+  while (i < len && isspace((unsigned char)src[i])) i++;
+  if (i >= len || src[i] != ':') return false;
+  i++;
+  while (i < len && isspace((unsigned char)src[i])) i++;
+  if (i >= len || src[i] != '"') return false;
+  i++;
+
+  const int e = src.indexOf('"', i);
   if (e < 0) return false;
-  const String v = src.substring(s, e);
-  snprintf(out, cap, "%s", v.c_str());
+  snprintf(out, cap, "%s", src.substring(i, e).c_str());
   return true;
 }
 
@@ -811,9 +831,26 @@ static void askCapture(float secs) {
   http.addHeader("Content-Type", "application/octet-stream");
   if (netToken.length()) http.addHeader("Authorization", String("Bearer ") + netToken);
 
-  const int code = http.POST((uint8_t *)buffer, recorded * sizeof(int16_t));
+  /* The default 5 s covers neither leg of this. A 6 s capture is ~390 KB to push
+   * over WiFi, and the console then spends 1.5-2 s in speech-to-text and
+   * translation. Timing out mid-reply looked exactly like an empty transcript,
+   * which the app then reported as SILENT — a working pipeline described as a
+   * dead microphone. */
+  http.setTimeout(30000);
+
+  const size_t sent = recorded * sizeof(int16_t);
+  const int code = http.POST((uint8_t *)buffer, sent);
   const String body = code > 0 ? http.getString() : String();
   http.end();
+
+  // Keep the outcome so `>last` can report it after the fact — the alternative is
+  // trying to have a serial capture running at the exact moment a button is held.
+  lastHttpCode = code;
+  lastSentBytes = sent;
+  lastBodyLen = body.length();
+  snprintf(lastBodyHead, sizeof lastBodyHead, "%s", body.substring(0, 110).c_str());
+  LOGI("translate", "http %d, sent %u B, reply %u B in %lu ms",
+       code, (unsigned)sent, (unsigned)body.length(), (unsigned long)(millis() - t0));
 
   if (code != 200) {
     askStatus("ERROR", C_HOT);
@@ -828,12 +865,21 @@ static void askCapture(float secs) {
   char target[8] = {0};
   jsonField(body, "target", target, sizeof target);
 
+  /* Clipping is worth surfacing rather than leaving as a mystery: it degrades
+   * recognition quietly, and "just speak" came back as "just pick" because of it. */
+  const bool clipped = lastPeak >= 32700;
+  if (clipped) LOGW("mic", "capture clipped at peak %ld — lower the gain", (long)lastPeak);
+
   if (!trTranscript[0]) {
-    askStatus("SILENT", C_WARN);
-    snprintf(trNote, sizeof trNote, "nothing heard — check the mic");
+    // Reaching here means a 200 with a body we could not parse, which is a bug
+    // here rather than a microphone problem. Say which.
+    askStatus(lastBodyLen ? "NO PARSE" : "SILENT", C_WARN);
+    if (lastBodyLen) snprintf(trNote, sizeof trNote, "reply %u B but no transcript field", (unsigned)lastBodyLen);
+    else             snprintf(trNote, sizeof trNote, "nothing heard — try >mic");
   } else {
     askStatus("READY", C_OK);
-    trNote[0] = 0;
+    if (clipped) snprintf(trNote, sizeof trNote, "clipped — speak further away");
+    else         trNote[0] = 0;
   }
   trPaintText();
   LOGI("translate", "%.1f s -> %s (%lu ms) \"%s\"", secs, target,
@@ -1251,6 +1297,15 @@ static void handleCommand(char *line) {
     brightFull = (uint8_t)v;
     if (powerState == PWR_AWAKE) gfx->setBrightness(brightFull);
     LOGI("pwr", "brightness %u", brightFull);
+  }
+  else if (!strcmp(line, ">last")) {
+    LOGI("last", "capture %u samples (%.2f s), peak %ld, rms %lu",
+         (unsigned)recorded, recorded / (float)CHANNELS / SAMPLE_RATE,
+         (long)lastPeak, (unsigned long)lastRms);
+    LOGI("last", "http %d, sent %u B, reply %u B",
+         lastHttpCode, (unsigned)lastSentBytes, (unsigned)lastBodyLen);
+    LOGI("last", "reply head: %s", lastBodyHead[0] ? lastBodyHead : "(empty)");
+    LOGI("last", "parsed transcript: %s", trTranscript[0] ? trTranscript : "(empty)");
   }
   else if (!strncmp(line, ">gain ", 6)) {
     /* ADC_REG16, the ADC scale: 0..7 = 0,6,12,18,24,30,36,42 dB. It is separate

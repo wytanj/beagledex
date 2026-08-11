@@ -75,10 +75,18 @@
  *   gain 7 (42 dB)   rms 1120   peak -4217..3581    ambient alone at -18 dBFS
  *
  * +18 dB of setting produced +18.4 dB of signal, so the whole chain is linear and
- * healthy — this was a level problem, not a fault. 5 is chosen over 7 so that
- * speech, which sits well above ambient, has somewhere to go before clipping.
- * Re-sweep with >gain if the enclosure or microphone port ever changes. */
-#define AUDIO_MIC_GAIN          5
+ * healthy — this was a level problem, not a fault.
+ *
+ * THEN MEASURED WITH ACTUAL SPEECH at gain 5: peak 32768, i.e. hard against the
+ * rail, rms 1583. Clipped. Speech sits roughly 20 dB above ambient, so 30 dB of
+ * gain is too much once someone actually talks — and the transcript showed it,
+ * returning "just pick" for "just speak". Backed off to 4 (24 dB), which puts
+ * speech peaks near -6 dBFS with ambient around rms 150.
+ *
+ * The original note about clipping hurting speech-to-text was right all along;
+ * it was the 12 dB conclusion that had stopped fitting. Re-sweep with >gain and
+ * check `>last` for peak 32768 whenever the enclosure or mic port changes. */
+#define AUDIO_MIC_GAIN          4
 #define AUDIO_VOICE_VOLUME      85
 
 /* ── Display: CO5300 AMOLED over QSPI, 368 x 448 ──────────────────────────────
