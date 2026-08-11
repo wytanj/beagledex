@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.23.0";
+static const char *FW_VERSION = "0.24.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -716,21 +716,28 @@ static FaceMode faceMode    = FACE_HOME;
 static uint32_t faceSince   = 0;
 static uint8_t  faceLastMin = 255;
 
-/* Photo-mode clock, positioned by the face descriptor (used only under a full
- * photo). */
+/* Photo-mode clock, positioned by the face descriptor. Drawn with a black
+ * drop-shadow so it reads over any photo without a heavy banner covering it. */
 static void faceDrawTime() {
   const int16_t ch = 8 * face.timeSize;
+  char t[8];
+  snprintf(t, sizeof t, rtc.valid ? "%02u:%02u" : "--:--", rtc.hour, rtc.min);
+
   gfx->setTextSize(face.timeSize);
-  gfx->setTextColor(face.timeColour);
-  gfx->setCursor(face.timeX, face.timeY);
-  if (rtc.valid) gfx->printf("%02u:%02u", rtc.hour, rtc.min);
-  else           gfx->print("--:--");
+  gfx->setTextColor(C_BG);                          // shadow
+  gfx->setCursor(face.timeX + 2, face.timeY + 2); gfx->print(t);
+  gfx->setTextColor(face.timeColour);               // fill
+  gfx->setCursor(face.timeX, face.timeY); gfx->print(t);
+
   if (face.showDate) {
+    char d[16];
+    if (rtc.valid) snprintf(d, sizeof d, "%04u-%02u-%02u", rtc.year, rtc.mon, rtc.day);
+    else           snprintf(d, sizeof d, "npm run push time");
     gfx->setTextSize(2);
-    gfx->setTextColor(rtc.valid ? C_DIM : C_WARN);
-    gfx->setCursor(face.timeX + 2, face.timeY + ch + 8);
-    if (rtc.valid) gfx->printf("%04u-%02u-%02u", rtc.year, rtc.mon, rtc.day);
-    else           gfx->print("npm run push time");
+    gfx->setTextColor(C_BG);
+    gfx->setCursor(face.timeX + 3, face.timeY + ch + 9); gfx->print(d);
+    gfx->setTextColor(rtc.valid ? C_ACCENT : C_WARN);
+    gfx->setCursor(face.timeX + 2, face.timeY + ch + 8); gfx->print(d);
   }
 }
 
