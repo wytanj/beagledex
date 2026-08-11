@@ -69,6 +69,14 @@ npm run push time            # set the RTC from this machine's clock
 
 ## Next up, in order
 
+0. **`/api/translate` is live and verified** — speech in, transcript and translation
+   out, measured end to end at **1.6 s** (STT 0.5 s, chat 1.0 s) on a 3.5 s clip.
+   xAI STT takes raw 16 kHz PCM directly, which is exactly what the ES8311 produces,
+   so nothing resamples or wraps anywhere. Not built: TTS back to the device, because
+   the shell has no playback path and gates the amplifier — returning audio nothing
+   can play would be a stub pretending to be a feature.
+   Remaining for a working translator: WiFi on the device, and the Translate app
+   (two language pickers + PTT).
 1. **Phase 3 transport.** The one thing standing between this and a working device.
    `/api/translate` has a frozen contract already returning 501, and the token sink is
    already shaped like a stream — so this is: WiFi provisioning, then POST capture,

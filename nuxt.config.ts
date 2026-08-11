@@ -15,6 +15,9 @@ export default defineNuxtConfig({
   runtimeConfig: {
     // Set DEVICE_TOKEN in .env. Device-facing routes reject requests without it.
     deviceToken: '',
+    // Set XAI_API_KEY in .env. Never shipped to the device — /api/translate holds
+    // the credential and the device only ever sends audio and renders text.
+    xaiApiKey: '',
   },
 
   devServer: { host: '0.0.0.0', port: 3000 },
