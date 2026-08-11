@@ -82,29 +82,39 @@ export default defineEventHandler(async (event) => {
     return ''
   }
 
+  /* Agent Tools API (/v1/responses), not chat completions: it lets grok search the
+   * web and X *when the question needs current information*, and answer from its own
+   * knowledge otherwise — so simple questions stay fast and "what's happening now"
+   * questions come back grounded. The old Live Search (search_parameters / the
+   * live_search tool) was retired Jan 2026 and 410s; this is the current path. */
   const t1 = Date.now()
   let answer = ''
   try {
-    const res = await fetch('https://api.x.ai/v1/chat/completions', {
+    const res = await fetch('https://api.x.ai/v1/responses', {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model,
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a concise voice assistant. Answer in plain spoken English, '
-              + '2 to 4 short sentences, suitable for reading aloud. No markdown, no lists, '
-              + 'no headings, no emoji, no special characters — just sentences.',
-          },
-          { role: 'user', content: question },
-        ],
+        instructions: 'You are a concise voice assistant with web and X search. Answer in '
+          + 'plain spoken English, 2 to 4 short sentences suitable for reading aloud. Search '
+          + 'when the question needs current information. No markdown, no lists, no headings, '
+          + 'no emoji, no special characters.',
+        input: [{ role: 'user', content: question }],
+        tools: [{ type: 'web_search' }, { type: 'x_search' }],
       }),
     })
-    if (!res.ok) return fail(`chat ${res.status}: ${(await res.text()).slice(0, 200)}`)
+    if (!res.ok) return fail(`responses ${res.status}: ${(await res.text()).slice(0, 200)}`)
     const j = await res.json() as any
-    answer = toAscii(j?.choices?.[0]?.message?.content ?? '')
-  } catch (e: any) { return fail(`chat: ${e?.message ?? e}`) }
+    // Pull the text out of the responses output list, then strip the inline
+    // [[n]](url) citation markers grok adds — they'd be read aloud as noise.
+    let raw = ''
+    for (const item of (j.output ?? [])) {
+      for (const c of (item.content ?? [])) {
+        if (c.type === 'output_text' || c.type === 'text') raw += c.text ?? ''
+      }
+    }
+    answer = toAscii(raw.replace(/\[\[\d+\]\]\([^)]*\)/g, '').replace(/\[\d+\]/g, ''))
+  } catch (e: any) { return fail(`responses: ${e?.message ?? e}`) }
 
   if (!answer) return fail('empty answer', 502)
   const msChat = Date.now() - t1
