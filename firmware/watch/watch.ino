@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.19.2";
+static const char *FW_VERSION = "0.20.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -162,7 +162,7 @@ static PowerState powerState   = PWR_AWAKE;
 static uint32_t   lastActivity = 0;
 static uint32_t   dimAfterMs   = 15000;
 static uint32_t   aodAfterMs   = 45000;   // → always-on face
-static uint32_t   offAfterMs   = 0;       // 0 = rest at AOD and never go fully dark
+static uint32_t   offAfterMs   = 180000;  // AOD then fully dark at 3 min idle (0 = never)
 static bool       aodEnabled   = true;
 static uint8_t    brightFull   = 255;
 static uint8_t    brightDim    = 40;
@@ -829,10 +829,15 @@ static void pickerPaint() {
 
   const int cur = pickerFor == 0 ? langA : langB;
   for (int i = 0; i < LANG_COUNT; i++) {
-    const int16_t x = (i & 1) ? PK_X1 : PAD;
+    // An odd count leaves the last language alone on its row — make it span the
+    // full width so it's a whole-row target, not a half-row with a dead right side
+    // nobody can tell isn't tappable.
+    const bool lastOdd = (i == LANG_COUNT - 1) && (LANG_COUNT & 1);
+    const int16_t x = lastOdd ? PAD : ((i & 1) ? PK_X1 : PAD);
+    const int16_t w = lastOdd ? BODY_W : PK_CELL_W;
     const int16_t y = PK_TOP + (i / 2) * PK_CELL_H;
     const bool sel = (i == cur);
-    gfx->fillRoundRect(x, y, PK_CELL_W, PK_CELL_H - 7, 6, sel ? C_ACCENT : C_CARD);
+    gfx->fillRoundRect(x, y, w, PK_CELL_H - 7, 6, sel ? C_ACCENT : C_CARD);
     gfx->setTextSize(2);
     gfx->setTextColor(sel ? C_BG : C_DIM);
     gfx->setCursor(x + 12, y + 12);
@@ -912,7 +917,9 @@ static void askGesture(Gesture g) {
     if (tapY < PK_TOP) { pickerFor = -1; askEnter(); return; }   // title = cancel
     const int col = tapX < PK_X1 ? 0 : 1;
     const int row = (tapY - PK_TOP) / PK_CELL_H;
-    const int idx = row * 2 + col;
+    int idx = row * 2 + col;
+    // The lone full-width last cell (odd count) is selectable from either column.
+    if ((LANG_COUNT & 1) && idx == LANG_COUNT) idx = LANG_COUNT - 1;
     if (idx >= 0 && idx < LANG_COUNT) {
       if (pickerFor == 0) langA = idx; else langB = idx;
       LOGI("translate", "pair %s-%s", LANGS[langA].code, LANGS[langB].code);
@@ -1369,10 +1376,23 @@ static void aodPaint(bool full) {
   else           gfx->print("--:--");
 }
 
+/* CPU frequency follows the screen. The S3's current scales hard with clock, and
+ * a dark, idle watch does not need 240 MHz to poll touch and tick a clock — 80 is
+ * plenty and cuts a good chunk of the standby draw. Full speed comes back on wake,
+ * before any WiFi (which needs >=80) or audio work. 80 is the floor that keeps USB
+ * serial and the radio usable. */
+static void cpuFast(bool fast) {
+  static bool isFast = true;
+  if (fast == isFast) return;
+  setCpuFrequencyMhz(fast ? 240 : 80);
+  isFast = fast;
+}
+
 static void wakeScreen() {
   if (!haveDisplay) return;
   const bool wasOff  = powerState == PWR_OFF;
   const bool wasDark = wasOff || powerState == PWR_AOD;
+  cpuFast(true);
   powerState = PWR_AWAKE;
   gfx->setBrightness(brightFull);
   if (wasDark) {
@@ -1401,8 +1421,9 @@ static void powerTick(uint32_t now) {
 
   } else if ((powerState == PWR_AWAKE || powerState == PWR_DIM) && aodAfterMs && idle > aodAfterMs) {
     // Radio goes either way: nobody is using it at rest, and 80 mA dwarfs the
-    // handful of milliamps the dim digits cost.
+    // handful of milliamps the dim digits cost. Drop the clock too.
     netSleep();
+    cpuFast(false);
     if (aodEnabled) {
       powerState = PWR_AOD;
       gfx->setBrightness(aodBright);
@@ -1431,6 +1452,7 @@ static void lockNow() {
   gfx->setBrightness(0);
   gfx->displayOff();
   netSleep();
+  cpuFast(false);
   LOGI("pwr", "locked");
 }
 
