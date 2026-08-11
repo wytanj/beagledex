@@ -147,12 +147,28 @@ export default defineEventHandler(async (event) => {
       const t2 = Date.now()
       try {
         const { pcm, seconds: spokenS } = await synthesize(translation, targetCode, key)
+
+        /* Render the reply to pixels too, so the device can SHOW it as well as
+         * speak it — the font it lacks lives here. Body is [text bitmap][audio];
+         * the device splits on the pixel byte count it computes from W x H. Text
+         * rendering is best-effort: if it fails, ship the audio alone. */
+        let textBuf = Buffer.alloc(0)
+        let tw = 0, th = 0
+        try {
+          const r = renderText(translation, targetCode, { width: 344, maxH: 156, size: 30 })
+          textBuf = r.rgb; tw = r.width; th = r.height
+        } catch (re: any) {
+          console.warn(`[translate] text render failed: ${re?.message ?? re}`)
+        }
+
         setHeader(event, 'Content-Type', 'application/octet-stream')
         setHeader(event, 'X-Audio-Format', 'pcm-s16le-16000-2ch')
         setHeader(event, 'X-Audio-Seconds', String(spokenS))
-        console.info(`[translate] ${pair} "${transcript}" -> spoke ${spokenS}s `
-          + `(stt ${msStt}ms, chat ${msChat}ms, tts ${Date.now() - t2}ms)`)
-        return pcm
+        setHeader(event, 'X-Text-W', String(tw))
+        setHeader(event, 'X-Text-H', String(th))
+        console.info(`[translate] ${pair} "${transcript}" -> spoke ${spokenS}s, `
+          + `text ${tw}x${th} (stt ${msStt}ms, chat ${msChat}ms, tts ${Date.now() - t2}ms)`)
+        return Buffer.concat([textBuf, pcm])
       } catch (e: any) {
         setHeader(event, 'X-Audio-Format', 'none')
         setHeader(event, 'X-Audio-Error', encodeURIComponent(String(e?.message ?? e).slice(0, 120)))

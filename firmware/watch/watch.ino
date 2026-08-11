@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.14.1";
+static const char *FW_VERSION = "0.15.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -670,6 +670,7 @@ static size_t   lastBodyLen   = 0;
 static char     lastBodyHead[120] = {0};
 
 static constexpr int16_t TR_ROW_H = 56;      // the two "you/them" cards, enlarged
+static constexpr int16_t TR_TEXT_Y = BODY_Y + 2 * TR_ROW_H + 44;   // result / rendered-reply area
 
 /* Full-screen language grid. Cycling forward through twelve languages meant a
  * careless tap had to be walked all the way around; a grid is direct selection,
@@ -933,8 +934,8 @@ static void askCapture(float secs) {
   /* The reply text rides in headers, so we never parse a body we are about to
    * play. Ask HTTPClient to keep the ones we need. */
   static const char *keep[] = { "X-Transcript", "X-Translation", "X-Target",
-                                "X-Audio-Format", "X-Audio-Error" };
-  http.collectHeaders(keep, 5);
+                                "X-Audio-Format", "X-Audio-Error", "X-Text-W", "X-Text-H" };
+  http.collectHeaders(keep, 7);
 
   /* The default 5 s covers none of this: a capture is a few hundred KB up, then
    * the console spends ~1.5 s on STT and translate and another ~1 s synthesising
@@ -967,40 +968,60 @@ static void askCapture(float secs) {
   if (clipped) LOGW("mic", "capture clipped at peak %ld — lower the gain", (long)lastPeak);
 
   if (fmt.startsWith("pcm")) {
-    /* Reuse the capture buffer for the reply — the upload is finished, so its
-     * contents are spent. Read the PCM stream straight into PSRAM, capped at the
-     * buffer, then play it. */
+    /* Body is [text bitmap][audio pcm]. Both stream into the spent capture buffer
+     * in turn: read the bitmap, blit it (this is the legible reply the ASCII font
+     * can't draw), then read the audio over it and play. Reused sequentially, so
+     * only the larger of the two needs to fit — and both do. */
     const size_t cap = MAX_SAMPLES * sizeof(int16_t);
     uint8_t *dst = (uint8_t *)buffer;
-    size_t got = 0;
     WiFiClient *stream = http.getStreamPtr();
-    const int total = http.getSize();
-    askStatus("SPEAKING", C_ACCENT);
-    snprintf(trNote, sizeof trNote, "%s", trTranscript[0] ? trTranscript : "playing reply");
-    trPaintText();
 
-    while (http.connected() && got < cap && (total < 0 || got < (size_t)total)) {
+    const int tw = http.header("X-Text-W").toInt();
+    const int th = http.header("X-Text-H").toInt();
+    const size_t textBytes = (size_t)tw * th * 2;
+
+    askStatus("SPEAKING", C_ACCENT);
+    gfx->fillRect(PAD, TR_TEXT_Y, BODY_W, BODY_Y + BODY_H - TR_TEXT_Y, C_BG);
+
+    // 1. the rendered reply
+    if (tw > 0 && th > 0 && textBytes <= cap) {
+      size_t got = 0;
+      while (http.connected() && got < textBytes) {
+        const size_t avail = stream->available();
+        if (avail) {
+          const size_t want = (textBytes - got < avail) ? textBytes - got : avail;
+          const int r = stream->readBytes(dst + got, want);
+          if (r <= 0) break;
+          got += r;
+        } else delay(2);
+      }
+      if (got == textBytes) gfx->draw16bitRGBBitmap(PAD, TR_TEXT_Y, (uint16_t *)buffer, tw, th);
+    }
+
+    // 2. the audio, over the same buffer
+    const int total = http.getSize();
+    const size_t audioTotal = (total > 0) ? (size_t)total - textBytes : 0;
+    size_t got = 0;
+    while (got < cap && (audioTotal == 0 || got < audioTotal)) {
       const size_t avail = stream->available();
       if (avail) {
         const size_t want = (cap - got < avail) ? cap - got : avail;
         const int r = stream->readBytes(dst + got, want);
         if (r <= 0) break;
         got += r;
-      } else {
-        delay(2);
-      }
+      } else if (!http.connected()) {
+        break;
+      } else delay(2);
     }
     http.end();
     lastBodyLen = got;
-    LOGI("translate", "http 200, sent %u B, spoke %u B in %lu ms",
-         (unsigned)sent, (unsigned)got, (unsigned long)(millis() - t0));
+    LOGI("translate", "http 200, sent %u B, text %dx%d, spoke %u B in %lu ms",
+         (unsigned)sent, tw, th, (unsigned)got, (unsigned long)(millis() - t0));
 
     playPcm(buffer, got / sizeof(int16_t));
 
+    // Status only — do NOT call trPaintText here, it would erase the blitted reply.
     askStatus(clipped ? "CLIPPED" : "READY", clipped ? C_WARN : C_OK);
-    snprintf(trNote, sizeof trNote, "spoke %s%s",
-             langLabel(target), clipped ? " (mic clipped)" : "");
-    trPaintText();
     return;
   }
 
