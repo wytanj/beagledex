@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.25.0";
+static const char *FW_VERSION = "0.25.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -1391,9 +1391,10 @@ static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY)
  * writes audio chunks to I2S and, between them, updates the highlight and polls
  * touch for the buttons. The console keeps the answer plain ASCII so the device's
  * font can draw exactly what is being said. */
-static char askgAnswer[512] = {0};
-static int  askgWordOff[110];
-static int  askgWordCount = 0;
+static char    askgAnswer[512] = {0};
+static int     askgWordOff[110];
+static int16_t askgWX[110], askgWY[110];   // pixel position of each word (laid out once)
+static int     askgWordCount = 0;
 static size_t askgSamples = 0;          // reply audio, in the shared capture buffer
 static size_t askgPos = 0;
 enum AgState : uint8_t { AG_IDLE, AG_PLAYING, AG_PAUSED, AG_DONE };
@@ -1405,16 +1406,46 @@ static constexpr int16_t AG_BTN_Y  = BODY_Y + BODY_H - AG_BTN_H - 4;
 static constexpr int16_t AG_BTN_W  = (BODY_W - 20) / 3;
 static int16_t agBtnX(int i) { return PAD + i * (AG_BTN_W + 10); }
 
-static void askgIndexWords() {
+/* Index words AND lay them out (wrap) once, so highlighting later only repaints
+ * the two words that change colour — no full-text clear, no flicker. */
+static void askgLayout() {
   askgWordCount = 0;
   const int n = (int)strlen(askgAnswer);
+  const int16_t maxX = PAD + BODY_W, maxY = AG_BTN_Y - 6, lineH = 22;
+  int16_t x = PAD, y = AG_TEXT_Y;
   int i = 0;
   while (i < n && askgWordCount < 110) {
     while (i < n && askgAnswer[i] == ' ') i++;
     if (i >= n) break;
-    askgWordOff[askgWordCount++] = i;
+    const int start = i;
     while (i < n && askgAnswer[i] != ' ') i++;
+    const int16_t wpx = (i - start) * 12;                 // size-2 font: 12 px/char
+    if (x + wpx > maxX && x > PAD) { x = PAD; y += lineH; }
+    if (y + 16 > maxY) break;                             // out of room: truncate the display
+    askgWordOff[askgWordCount] = start;
+    askgWX[askgWordCount] = x;
+    askgWY[askgWordCount] = y;
+    askgWordCount++;
+    x += wpx + 12;
   }
+}
+
+static void askgWordText(int w, char *out, int cap) {
+  int start = askgWordOff[w], end = start;
+  const int n = (int)strlen(askgAnswer);
+  while (end < n && askgAnswer[end] != ' ') end++;
+  int wl = end - start; if (wl > cap - 1) wl = cap - 1;
+  memcpy(out, askgAnswer + start, wl); out[wl] = 0;
+}
+
+/* Redraw one word in place. The built-in font draws opaque glyph pixels on a
+ * transparent background, so redrawing the same word at the same spot in a new
+ * colour overwrites exactly — no clear needed, no flicker. */
+static void askgDrawWord(int w, uint16_t colour) {
+  if (w < 0 || w >= askgWordCount) return;
+  char word[48]; askgWordText(w, word, sizeof word);
+  gfx->setTextSize(2); gfx->setTextColor(colour);
+  gfx->setCursor(askgWX[w], askgWY[w]); gfx->print(word);
 }
 
 /* Which word should be lit at elapsed-ms, from the char-offset estimate. */
@@ -1430,44 +1461,42 @@ static int askgWordAt(uint32_t ms) {
   return w;
 }
 
-static void askgPaintText(int hl) {
-  const int16_t maxX = PAD + BODY_W, maxY = AG_BTN_Y - 6, lineH = 20;
-  gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, maxY - AG_TEXT_Y, C_BG);
-  gfx->setTextSize(2);
-  int16_t x = PAD, y = AG_TEXT_Y;
-  for (int w = 0; w < askgWordCount && y < maxY; w++) {
-    const int start = askgWordOff[w];
-    int end = (w + 1 < askgWordCount) ? askgWordOff[w + 1] : (int)strlen(askgAnswer);
-    while (end > start && askgAnswer[end - 1] == ' ') end--;
-    int wl = end - start; if (wl > 47) wl = 47;
-    char word[48]; memcpy(word, askgAnswer + start, wl); word[wl] = 0;
-    const int16_t wpx = wl * 12;
-    if (x + wpx > maxX && x > PAD) { x = PAD; y += lineH; if (y >= maxY) break; }
-    gfx->setTextColor(w == hl ? C_ACCENT : C_DIM);
-    gfx->setCursor(x, y); gfx->print(word);
-    x += wpx + 12;
+/* Full text draw (once, on entry / answer). */
+static void askgPaintAll(int hl) {
+  gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, (AG_BTN_Y - 6) - AG_TEXT_Y, C_BG);
+  for (int w = 0; w < askgWordCount; w++) askgDrawWord(w, w == hl ? C_ACCENT : C_DIM);
+}
+
+/* Move the highlight: dim the old word, light the new one. No clear -> no flicker. */
+static void askgHighlight(int oldW, int newW) {
+  if (oldW != newW) askgDrawWord(oldW, C_DIM);
+  askgDrawWord(newW, C_ACCENT);
+}
+
+/* Just the play/pause button (redrawn when it toggles, so it never vanishes). */
+static void askgDrawPlayBtn() {
+  const int16_t x = agBtnX(0), y = AG_BTN_Y, cx = x + AG_BTN_W / 2, cy = y + AG_BTN_H / 2;
+  gfx->fillRoundRect(x, y, AG_BTN_W, AG_BTN_H, 12, C_CARD);
+  if (askgState == AG_PLAYING) {                    // pause: two bars
+    gfx->fillRect(cx - 8, cy - 11, 6, 22, C_ACCENT);
+    gfx->fillRect(cx + 2, cy - 11, 6, 22, C_ACCENT);
+  } else {                                          // play: right triangle
+    gfx->fillTriangle(cx - 8, cy - 11, cx - 8, cy + 11, cx + 11, cy, C_ACCENT);
   }
 }
 
-/* Three rounded transport buttons, icons drawn from primitives (no icon font). */
+/* All three rounded transport buttons. Icons from primitives (no icon font). */
 static void askgDrawButtons() {
-  for (int i = 0; i < 3; i++) {
-    const int16_t x = agBtnX(i), y = AG_BTN_Y, cx = x + AG_BTN_W / 2, cy = y + AG_BTN_H / 2;
-    gfx->fillRoundRect(x, y, AG_BTN_W, AG_BTN_H, 12, C_CARD);
-    if (i == 0) {                                   // play / pause
-      if (askgState == AG_PLAYING) {                // pause: two bars
-        gfx->fillRect(cx - 8, cy - 11, 6, 22, C_ACCENT);
-        gfx->fillRect(cx + 2, cy - 11, 6, 22, C_ACCENT);
-      } else {                                      // play: right triangle
-        gfx->fillTriangle(cx - 8, cy - 11, cx - 8, cy + 11, cx + 11, cy, C_ACCENT);
-      }
-    } else if (i == 1) {                            // stop: square
-      gfx->fillRect(cx - 10, cy - 10, 20, 20, C_HOT);
-    } else {                                        // restart: bar + left triangle
-      gfx->fillRect(cx - 12, cy - 11, 5, 22, C_ACCENT);
-      gfx->fillTriangle(cx + 11, cy - 11, cx + 11, cy + 11, cx - 6, cy, C_ACCENT);
-    }
-  }
+  askgDrawPlayBtn();
+  // stop: red square
+  int16_t x = agBtnX(1), cx = x + AG_BTN_W / 2, cy = AG_BTN_Y + AG_BTN_H / 2;
+  gfx->fillRoundRect(x, AG_BTN_Y, AG_BTN_W, AG_BTN_H, 12, C_CARD);
+  gfx->fillRect(cx - 10, cy - 10, 20, 20, C_HOT);
+  // replay: a backwards (left-pointing) arrow — head on the left, shaft to the right
+  x = agBtnX(2); cx = x + AG_BTN_W / 2;
+  gfx->fillRoundRect(x, AG_BTN_Y, AG_BTN_W, AG_BTN_H, 12, C_CARD);
+  gfx->fillTriangle(cx - 13, cy, cx - 3, cy - 10, cx - 3, cy + 10, C_ACCENT);
+  gfx->fillRect(cx - 3, cy - 3, 15, 6, C_ACCENT);
 }
 
 static int askgButtonAt(uint16_t x, uint16_t y) {
@@ -1476,26 +1505,32 @@ static int askgButtonAt(uint16_t x, uint16_t y) {
   return -1;
 }
 
-/* Blocking-but-interactive playback: chunk to I2S, update highlight, poll buttons. */
+/* Blocking-but-interactive playback: chunk to I2S, update the highlight
+ * incrementally, poll touch for the buttons. */
 static void askgPlay() {
-  if (!haveAudio || askgSamples == 0) return;
+  if (!haveAudio || askgSamples == 0) { LOGW("ask", "nothing to play (%u samples)", (unsigned)askgSamples); return; }
+  LOGI("ask", "play %u samples (%.1f s)", (unsigned)askgSamples, askgSamples / (float)CHANNELS / SAMPLE_RATE);
   askgState = AG_PLAYING;
   audioBusy = true;
+  askgPaintAll(-1);
+  askgDrawButtons();
   es8311_voice_mute(codec, false);
   digitalWrite(PA, HIGH);
   delay(8);
-  askgDrawButtons();
-  int lastHl = -2;
+  int lastHl = -1;
   bool muted = false;
 
   while (askgState == AG_PLAYING || askgState == AG_PAUSED) {
     const Gesture g = pollGesture();
     if (g == G_TAP) {
       const int b = askgButtonAt(tapX, tapY);
-      if (b == 0)      askgState = (askgState == AG_PLAYING) ? AG_PAUSED : AG_PLAYING;
-      else if (b == 1) askgState = AG_DONE;                 // stop
-      else if (b == 2) { askgPos = 0; askgState = AG_PLAYING; }  // restart
-      if (b >= 0) askgDrawButtons();
+      if (b == 0)      { askgState = (askgState == AG_PLAYING) ? AG_PAUSED : AG_PLAYING; askgDrawPlayBtn(); }
+      else if (b == 1) askgState = AG_DONE;                              // stop
+      else if (b == 2) {                                                // restart
+        askgPos = 0;
+        if (lastHl >= 0) { askgDrawWord(lastHl, C_DIM); lastHl = -1; }
+        askgState = AG_PLAYING; askgDrawPlayBtn();
+      }
     }
 
     if (askgState == AG_PAUSED) {
@@ -1512,19 +1547,20 @@ static void askgPlay() {
 
     const uint32_t elapsed = (uint32_t)((uint64_t)(askgPos / CHANNELS) * 1000 / SAMPLE_RATE);
     const int hl = askgWordAt(elapsed);
-    if (hl != lastHl) { lastHl = hl; askgPaintText(hl); }
+    if (hl != lastHl) { askgHighlight(lastHl, hl); lastHl = hl; }
   }
 
   es8311_voice_mute(codec, true);
   digitalWrite(PA, LOW);
   audioBusy = false;
-  askgPaintText(-1);              // clear the highlight when done/stopped
-  askgDrawButtons();
+  if (lastHl >= 0) askgDrawWord(lastHl, C_DIM);      // drop the final highlight
+  askgState = AG_DONE;
+  askgDrawPlayBtn();                                  // back to the play glyph
 }
 
 static void askgEnter() {
   clearBody();
-  if (askgAnswer[0]) { askgPaintText(-1); askgDrawButtons(); }
+  if (askgAnswer[0]) { askgPaintAll(-1); askgDrawButtons(); }
   else {
     gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
     gfx->setCursor(PAD, BODY_Y + 40);
@@ -1596,7 +1632,7 @@ static void askgCapture(float secs) {
     } else delay(2);
   }
   askgAnswer[got] = 0;
-  askgIndexWords();
+  askgLayout();
 
   // 2. the audio, into the capture buffer
   const size_t cap = MAX_SAMPLES * sizeof(int16_t);
@@ -1617,7 +1653,7 @@ static void askgCapture(float secs) {
   askgSamples = ab / sizeof(int16_t);
   LOGI("ask", "answer %d chars, %u words, %u audio samples", got, askgWordCount, (unsigned)askgSamples);
 
-  askgPaintText(-1);
+  askgPaintAll(-1);
   if (askgSamples) askgPlay();        // auto-read the answer
   else askgDrawButtons();
 }
