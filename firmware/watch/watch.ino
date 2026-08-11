@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.13.1";
+static const char *FW_VERSION = "0.14.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -669,28 +669,66 @@ static size_t   lastSentBytes = 0;
 static size_t   lastBodyLen   = 0;
 static char     lastBodyHead[120] = {0};
 
-static constexpr int16_t TR_ROW_H = 42;
+static constexpr int16_t TR_ROW_H = 56;      // the two "you/them" cards, enlarged
+
+/* Full-screen language grid. Cycling forward through twelve languages meant a
+ * careless tap had to be walked all the way around; a grid is direct selection,
+ * with targets big enough not to mis-tap in the first place. -1 = closed, else
+ * the side being chosen (0 = you, 1 = them). */
+static int pickerFor = -1;
+static constexpr int16_t PK_TOP    = BODY_Y + 30;
+static constexpr int16_t PK_CELL_H = 47;
+static constexpr int16_t PK_CELL_W = (LCD_WIDTH - 2 * PAD - 8) / 2;   // two columns, small gap
+static constexpr int16_t PK_X1     = PAD + PK_CELL_W + 8;
 
 /* The built-in GFX font is ASCII. Japanese, Chinese, Korean and Thai would render
- * as mojibake, which looks like a fault rather than a missing feature — so say so
- * instead. The fix is to have the console rasterise the reply to a bitmap and blit
- * it, which is the same trick the watch face already uses. */
+ * as mojibake, so the device speaks those replies instead of drawing them and the
+ * screen shows only what it can. */
 static bool renderable(const char *s) {
   for (const unsigned char *p = (const unsigned char *)s; *p; p++) if (*p >= 0x80) return false;
   return true;
 }
 
+/* The two selector cards. Bigger now, with the language in the accent colour and
+ * a chevron to say they are tappable. */
 static void trPaintRows() {
   for (int i = 0; i < 2; i++) {
     const int16_t y = BODY_Y + i * TR_ROW_H;
-    gfx->fillRoundRect(PAD, y, BODY_W, TR_ROW_H - 6, 6, C_CARD);
+    gfx->fillRoundRect(PAD, y, BODY_W, TR_ROW_H - 8, 8, C_CARD);
     gfx->setTextSize(2);
     gfx->setTextColor(C_DIM);
-    gfx->setCursor(PAD + 10, y + 10);
-    gfx->print(i == 0 ? "you " : "them");
+    gfx->setCursor(PAD + 12, y + 16);
+    gfx->print(i == 0 ? "you" : "them");
+    gfx->setTextSize(3);
     gfx->setTextColor(C_ACCENT);
-    gfx->setCursor(PAD + 80, y + 10);
+    gfx->setCursor(PAD + 84, y + 12);
     gfx->print(LANGS[i == 0 ? langA : langB].label);
+    gfx->setTextSize(2);
+    gfx->setTextColor(C_FAINT);
+    gfx->setCursor(LCD_WIDTH - PAD - 22, y + 16);
+    gfx->print(">");
+  }
+}
+
+/* The picker: a 2-column grid of every language, current one filled. Tap to
+ * choose; tap the title to back out unchanged. */
+static void pickerPaint() {
+  clearBody();
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD, BODY_Y + 4);
+  gfx->printf("%s speaks:  (tap here to cancel)", pickerFor == 0 ? "you" : "them");
+
+  const int cur = pickerFor == 0 ? langA : langB;
+  for (int i = 0; i < LANG_COUNT; i++) {
+    const int16_t x = (i & 1) ? PK_X1 : PAD;
+    const int16_t y = PK_TOP + (i / 2) * PK_CELL_H;
+    const bool sel = (i == cur);
+    gfx->fillRoundRect(x, y, PK_CELL_W, PK_CELL_H - 7, 6, sel ? C_ACCENT : C_CARD);
+    gfx->setTextSize(2);
+    gfx->setTextColor(sel ? C_BG : C_DIM);
+    gfx->setCursor(x + 12, y + 12);
+    gfx->print(LANGS[i].label);
   }
 }
 
@@ -739,30 +777,42 @@ static void askStatus(const char *s, uint16_t colour) {   // kept: the shell cal
 
 static void askEnter() {
   clearBody();
+  if (pickerFor >= 0) { pickerPaint(); return; }
   trPaintRows();
   if (!haveAudio) { snprintf(trStatusText, sizeof trStatusText, "NO AUDIO"); trStatusColour = C_HOT; }
   trPaintStatus();
   if (!trTranscript[0] && !trTranslation[0] && !trNote[0])
-    snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
+    snprintf(trNote, sizeof trNote, "tap a language, or hold BOOT to talk");
   trPaintText();
 }
 
 static void askTick(uint32_t) {}
 
-/* Tap the top row to change your language, the second row to change theirs,
- * anything below to clear the last result. */
 static void askGesture(Gesture g) {
   if (g != G_TAP) return;
-  if (tapY < BODY_Y + TR_ROW_H)          langA = (langA + 1) % LANG_COUNT;
-  else if (tapY < BODY_Y + 2 * TR_ROW_H) langB = (langB + 1) % LANG_COUNT;
+
+  if (pickerFor >= 0) {                              // choosing a language
+    if (tapY < PK_TOP) { pickerFor = -1; askEnter(); return; }   // title = cancel
+    const int col = tapX < PK_X1 ? 0 : 1;
+    const int row = (tapY - PK_TOP) / PK_CELL_H;
+    const int idx = row * 2 + col;
+    if (idx >= 0 && idx < LANG_COUNT) {
+      if (pickerFor == 0) langA = idx; else langB = idx;
+      LOGI("translate", "pair %s-%s", LANGS[langA].code, LANGS[langB].code);
+    }
+    pickerFor = -1;
+    askEnter();
+    return;
+  }
+
+  // main view: a card opens its picker; a tap below clears the last result
+  if (tapY < BODY_Y + TR_ROW_H)          { pickerFor = 0; askEnter(); }
+  else if (tapY < BODY_Y + 2 * TR_ROW_H) { pickerFor = 1; askEnter(); }
   else {
     trTranscript[0] = trTranslation[0] = 0;
     snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
     trPaintText();
-    return;
   }
-  LOGI("translate", "pair %s-%s", LANGS[langA].code, LANGS[langB].code);
-  trPaintRows();
 }
 
 /* Pull one JSON string field out without dragging in a parser. The device only
@@ -840,6 +890,7 @@ static void playPcm(const int16_t *pcm, size_t samples) {
 
 static void askCapture(float secs) {
   trTranscript[0] = trTranslation[0] = 0;
+  if (pickerFor >= 0) { pickerFor = -1; clearBody(); trPaintRows(); }  // results need the main view
 
   /* Distinguish "you let go too early" from "the microphone heard nothing". Both
    * used to say SILENT, which sent me hunting a hardware fault that did not
@@ -1405,6 +1456,13 @@ static void handleCommand(char *line) {
     es8311_microphone_gain_set(codec, (es8311_mic_gain_t)g);
     LOGI("mic", "ADC scale %d (+%d dB); build default is %d (+%d dB)",
          g, g * 6, AUDIO_MIC_GAIN, AUDIO_MIC_GAIN * 6);
+  }
+  else if (!strncmp(line, ">vol ", 5)) {
+    if (!haveAudio) { LOGW("mic", "audio not up"); return; }
+    int v = atoi(line + 5);
+    if (v < 0) v = 0; if (v > 100) v = 100;
+    es8311_voice_volume_set(codec, v, nullptr);
+    LOGI("mic", "DAC volume %d (build default %d); loudness mostly comes from host normalisation", v, AUDIO_VOICE_VOLUME);
   }
   else if (!strcmp(line, ">mic")) {
     /* Describe the raw ADC output numerically, which distinguishes the three

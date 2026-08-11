@@ -58,9 +58,18 @@ export async function synthesize(text: string, lang: string, key: string, voice 
     mono.set(channelData[0].subarray(0, n))
   }
 
+  /* Peak-normalise. xAI's speech comes back around -10 dBFS, and this board drives
+   * a tiny speaker through a fixed-gain amp — the codec's volume register is only
+   * a couple of dB near the top. Scaling the whole clip so its loudest sample sits
+   * just under full scale is ~+9 dB, the largest lever available and free (one
+   * pass we are already making). Capped so a quiet clip is lifted, not a silent
+   * one amplified into hiss. */
+  let peak = 0
+  for (let i = 0; i < n; i++) { const a = Math.abs(mono[i]); if (a > peak) peak = a }
+  const norm = peak > 0.01 ? Math.min(0.97 / peak, 8) : 1   // target -0.3 dBFS, at most +18 dB
+
   // Resample whatever xAI emitted (24 kHz observed) to the device's 16 kHz, and
-  // interleave the result into two slots as we go. Linear interpolation is plenty
-  // for speech — the artefacts sit far above what a small speaker reproduces.
+  // interleave into two slots as we go. Linear interpolation is plenty for speech.
   const outN = Math.max(1, Math.floor((n * DEVICE_RATE) / sampleRate))
   const pcm = Buffer.allocUnsafe(outN * 4)          // 2 slots * 2 bytes
   const step = sampleRate / DEVICE_RATE
@@ -70,7 +79,7 @@ export async function synthesize(text: string, lang: string, key: string, voice 
     const frac = src - i0
     const a = mono[i0] ?? 0
     const b = i0 + 1 < n ? mono[i0 + 1] : a
-    let v = Math.round((a * (1 - frac) + b * frac) * 32767)
+    let v = Math.round((a * (1 - frac) + b * frac) * norm * 32767)
     if (v > 32767) v = 32767
     else if (v < -32768) v = -32768
     pcm.writeInt16LE(v, i * 4)

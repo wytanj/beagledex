@@ -87,7 +87,12 @@
  * it was the 12 dB conclusion that had stopped fitting. Re-sweep with >gain and
  * check `>last` for peak 32768 whenever the enclosure or mic port changes. */
 #define AUDIO_MIC_GAIN          4
-#define AUDIO_VOICE_VOLUME      85
+#define AUDIO_VOICE_VOLUME      100   /* DAC full scale. The real loudness lever is
+                                       * host-side peak normalisation in tts.ts;
+                                       * this register spans only ~a few dB up here.
+                                       * The PA is a fixed-gain amp — no software
+                                       * control — so 100 plus normalisation is as
+                                       * loud as this hardware goes. */
 
 /* ── Display: CO5300 AMOLED over QSPI, 368 x 448 ──────────────────────────────
  * NOT SH8601, whatever the v1 documentation says. The two board revisions ship
