@@ -58,15 +58,16 @@ export async function synthesize(text: string, lang: string, key: string, voice 
     mono.set(channelData[0].subarray(0, n))
   }
 
-  /* Peak-normalise. xAI's speech comes back around -10 dBFS, and this board drives
-   * a tiny speaker through a fixed-gain amp — the codec's volume register is only
-   * a couple of dB near the top. Scaling the whole clip so its loudest sample sits
-   * just under full scale is ~+9 dB, the largest lever available and free (one
-   * pass we are already making). Capped so a quiet clip is lifted, not a silent
-   * one amplified into hiss. */
+  /* Peak-normalise, but leave real headroom. Targeting near full scale (-0.3 dBFS)
+   * made speech buzz: this drives a tiny speaker through a fixed-gain class-D amp,
+   * and speech has a high peak-to-average ratio, so the loud peaks overdrive the
+   * speaker mechanically long before digital clipping. -6 dBFS keeps the peaks
+   * clean while still lifting xAI's quiet ~-10 dBFS output. Tune with TTS_PEAK
+   * (0..1) without a rebuild — the dev server hot-reloads this file. */
+  const target = Math.min(Math.max(Number(process.env.TTS_PEAK ?? 0.5), 0.05), 0.95)
   let peak = 0
   for (let i = 0; i < n; i++) { const a = Math.abs(mono[i]); if (a > peak) peak = a }
-  const norm = peak > 0.01 ? Math.min(0.97 / peak, 8) : 1   // target -0.3 dBFS, at most +18 dB
+  const norm = peak > 0.01 ? Math.min(target / peak, 8) : 1   // at most +18 dB, so silence stays silent
 
   // Resample whatever xAI emitted (24 kHz observed) to the device's 16 kHz, and
   // interleave into two slots as we go. Linear interpolation is plenty for speech.

@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.14.0";
+static const char *FW_VERSION = "0.14.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
