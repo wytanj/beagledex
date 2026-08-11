@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.19.1";
+static const char *FW_VERSION = "0.19.2";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -773,8 +773,13 @@ static constexpr int16_t TR_TEXT_Y = BODY_Y + 2 * TR_ROW_H + 44;   // result / r
  * with targets big enough not to mis-tap in the first place. -1 = closed, else
  * the side being chosen (0 = you, 1 = them). */
 static int pickerFor = -1;
-static constexpr int16_t PK_TOP    = BODY_Y + 30;
-static constexpr int16_t PK_CELL_H = 47;
+/* Sized so the whole grid stays inside the body region (BODY_Y..BODY_Y+BODY_H),
+ * which is all that clearBody() and askEnter() wipe. With 13 languages that's a
+ * 7th row; at the old 47 px pitch the last cell fell BELOW the clear zone and its
+ * remnant (Hokkien, the last tab) survived leaving the picker. 41 px keeps 7 rows
+ * (up to 14 languages) fully inside — beyond that it would need to scroll. */
+static constexpr int16_t PK_TOP    = BODY_Y + 26;
+static constexpr int16_t PK_CELL_H = 41;
 static constexpr int16_t PK_CELL_W = (LCD_WIDTH - 2 * PAD - 8) / 2;   // two columns, small gap
 static constexpr int16_t PK_X1     = PAD + PK_CELL_W + 8;
 
