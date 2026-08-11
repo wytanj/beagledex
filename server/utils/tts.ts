@@ -64,7 +64,7 @@ export async function synthesize(text: string, lang: string, key: string, voice 
    * speaker mechanically long before digital clipping. -6 dBFS keeps the peaks
    * clean while still lifting xAI's quiet ~-10 dBFS output. Tune with TTS_PEAK
    * (0..1) without a rebuild — the dev server hot-reloads this file. */
-  const target = Math.min(Math.max(Number(process.env.TTS_PEAK ?? 0.6), 0.05), 0.95)
+  const target = Math.min(Math.max(Number(process.env.TTS_PEAK ?? 0.5), 0.05), 0.95)
   let peak = 0
   for (let i = 0; i < n; i++) { const a = Math.abs(mono[i]); if (a > peak) peak = a }
   const norm = peak > 0.01 ? Math.min(target / peak, 8) : 1   // at most +18 dB, so silence stays silent

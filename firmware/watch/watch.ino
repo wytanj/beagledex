@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.22.0";
+static const char *FW_VERSION = "0.22.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -841,9 +841,10 @@ static constexpr int16_t TALK_TEXT_Y   = BODY_Y + 96;
  * else the side being chosen (0 = you, 1 = them). */
 static int pickerFor = -1;
 static int pickerTop = 0;                    // index of the first visible row
+/* 4 big cards per page, sized and styled like the app launcher for consistency. */
 static constexpr int16_t PK_TOP   = BODY_Y + 30;
-static constexpr int16_t PK_ROW_H = 46;
-static constexpr int     PK_VIS   = (BODY_H - (PK_TOP - BODY_Y)) / PK_ROW_H;
+static constexpr int16_t PK_ROW_H = 70;
+static constexpr int     PK_VIS   = (BODY_H - (PK_TOP - BODY_Y)) / PK_ROW_H;   // = 4
 static constexpr int     PK_MAXTOP = (LANG_COUNT > PK_VIS) ? (LANG_COUNT - PK_VIS) : 0;
 
 /* The built-in GFX font is ASCII. Japanese/Chinese/Korean/Thai/Hokkien would
@@ -931,11 +932,13 @@ static void pickerPaint() {
     const int i = pickerTop + r;
     if (i >= LANG_COUNT) break;
     const int16_t y = PK_TOP + r * PK_ROW_H;
+    const int16_t cardH = PK_ROW_H - 8;
+    const int16_t ty = y + cardH / 2 - 11;             // vertically centred label
     const bool sel = (i == cur);
-    gfx->fillRoundRect(PAD, y, BODY_W, PK_ROW_H - 6, 8, sel ? C_ACCENT : C_CARD);
-    gfx->setTextSize(3); gfx->setTextColor(sel ? C_BG : C_DIM);
-    gfx->setCursor(PAD + 16, y + 9); gfx->print(LANGS[i].label);
-    if (LANGS[i].beta) betaTag(PAD + 16 + (int)strlen(LANGS[i].label) * 18 + 8, y + 9, sel);
+    gfx->fillRoundRect(PAD, y, BODY_W, cardH, 12, sel ? C_ACCENT : C_CARD);
+    gfx->setTextSize(3); gfx->setTextColor(sel ? C_BG : C_ACCENT);
+    gfx->setCursor(PAD + 16, ty); gfx->print(LANGS[i].label);
+    if (LANGS[i].beta) betaTag(PAD + 16 + (int)strlen(LANGS[i].label) * 18 + 8, ty, sel);
   }
   // Scroll arrows so it's clear there's more than fits.
   gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
@@ -974,8 +977,8 @@ static void pickerScroll(int delta) {
 
 static void askGesture(Gesture g) {
   if (pickerFor >= 0) {                              // picker is modal (see the loop)
-    if (g == G_SWIPE_U) { pickerScroll(PK_VIS - 1); return; }
-    if (g == G_SWIPE_D) { pickerScroll(-(PK_VIS - 1)); return; }
+    if (g == G_SWIPE_U) { pickerScroll(PK_VIS); return; }   // next page of 4
+    if (g == G_SWIPE_D) { pickerScroll(-PK_VIS); return; }
     if (g != G_TAP) return;
     if (tapY < PK_TOP) { pickerFor = -1; askEnter(); return; }   // title = cancel
     const int row = (tapY - PK_TOP) / PK_ROW_H;
