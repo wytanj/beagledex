@@ -219,6 +219,30 @@ both, so a head-to-head isolates the understanding leg.
   documented `generateContent` format; **verify once a GEMINI_API_KEY exists** — it
   fails cleanly with an X-Error until then.
 
+### The balance ruling (grok vs gemini free tier)
+
+Decision: **grok stays the default; gemini is a toggle, not the default.** Reasoning,
+from measurement and from how the cost actually flows, not from the sticker price:
+
+- **Latency is the product for a translator.** Measured host->cloud: grok ~1.4 s,
+  gemini ~2.9 s — a ~1.5 s pause per exchange in a live face-to-face conversation.
+  Gemini's free tier does not buy back that pause.
+- **Gemini-free only zeroes HALF the cost as wired.** TTS is xAI for both providers,
+  so switching the understanding leg to gemini-free still pays for xAI TTS. It saves
+  the STT+chat portion only — which on grok is already ~$0.001–0.002 per
+  translation. The saving is roughly a couple of dollars a month at heavy use.
+- **Free tier trains on your data** ("context used to improve our products"). Fine
+  for casual translation (not sensitive); a hard no for agent/ops commands.
+
+So gemini-free is a **weak production cost play**: it saves little, doubles latency,
+and trains on your data. Its real use is experimentation and the on-device A/B. The
+genuine cost-to-zero lever is **local STT + TTS** (free, private, and fast enough) —
+that is what to build when cost truly matters, not cloud-free-tier hopping.
+
+Net: translator → grok (default). Casual/bulk, latency-tolerant translation and you
+want $0 → tap to gemini (it persists). Agent/ops commands → paid or local, never
+free tier. Real savings → local STT/TTS.
+
 Why this matters beyond translate: the agent app should reuse the same adapter. And
 Gemini's **function calling** fits voice-command routing unusually well — audio →
 structured tool call to the MCP in a single call. Note the free-tier caveat:
