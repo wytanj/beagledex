@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.24.0";
+static const char *FW_VERSION = "0.25.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -1377,6 +1377,251 @@ static void settingsTick(uint32_t now) {
 }
 static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY); }
 
+/* ── app: Ask Grok ────────────────────────────────────────────────────────────
+ * Hold BOOT, ask a question, and grok-4.5's answer is shown AND read aloud with
+ * each word highlighted as it's spoken. Three transport buttons — play/pause,
+ * stop, restart — work during playback.
+ *
+ * There are no per-word timestamps from the TTS, so the highlight time is
+ * ESTIMATED: each word's start is its character offset as a fraction of the whole,
+ * scaled to the audio duration. It drifts a little from the real speech (pauses,
+ * punctuation) but tracks well enough to follow, and costs no extra round trip.
+ *
+ * Playback is a blocking-but-interactive loop, like the translate reply — it
+ * writes audio chunks to I2S and, between them, updates the highlight and polls
+ * touch for the buttons. The console keeps the answer plain ASCII so the device's
+ * font can draw exactly what is being said. */
+static char askgAnswer[512] = {0};
+static int  askgWordOff[110];
+static int  askgWordCount = 0;
+static size_t askgSamples = 0;          // reply audio, in the shared capture buffer
+static size_t askgPos = 0;
+enum AgState : uint8_t { AG_IDLE, AG_PLAYING, AG_PAUSED, AG_DONE };
+static AgState askgState = AG_IDLE;
+
+static constexpr int16_t AG_TEXT_Y = BODY_Y + 2;
+static constexpr int16_t AG_BTN_H  = 52;
+static constexpr int16_t AG_BTN_Y  = BODY_Y + BODY_H - AG_BTN_H - 4;
+static constexpr int16_t AG_BTN_W  = (BODY_W - 20) / 3;
+static int16_t agBtnX(int i) { return PAD + i * (AG_BTN_W + 10); }
+
+static void askgIndexWords() {
+  askgWordCount = 0;
+  const int n = (int)strlen(askgAnswer);
+  int i = 0;
+  while (i < n && askgWordCount < 110) {
+    while (i < n && askgAnswer[i] == ' ') i++;
+    if (i >= n) break;
+    askgWordOff[askgWordCount++] = i;
+    while (i < n && askgAnswer[i] != ' ') i++;
+  }
+}
+
+/* Which word should be lit at elapsed-ms, from the char-offset estimate. */
+static int askgWordAt(uint32_t ms) {
+  if (askgWordCount == 0) return -1;
+  const int n = (int)strlen(askgAnswer);
+  const uint32_t totalMs = (uint32_t)((uint64_t)(askgSamples / CHANNELS) * 1000 / SAMPLE_RATE);
+  int w = 0;
+  for (int i = 0; i < askgWordCount; i++) {
+    const uint32_t startMs = (uint32_t)((uint64_t)askgWordOff[i] * totalMs / (n ? n : 1));
+    if (ms >= startMs) w = i; else break;
+  }
+  return w;
+}
+
+static void askgPaintText(int hl) {
+  const int16_t maxX = PAD + BODY_W, maxY = AG_BTN_Y - 6, lineH = 20;
+  gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, maxY - AG_TEXT_Y, C_BG);
+  gfx->setTextSize(2);
+  int16_t x = PAD, y = AG_TEXT_Y;
+  for (int w = 0; w < askgWordCount && y < maxY; w++) {
+    const int start = askgWordOff[w];
+    int end = (w + 1 < askgWordCount) ? askgWordOff[w + 1] : (int)strlen(askgAnswer);
+    while (end > start && askgAnswer[end - 1] == ' ') end--;
+    int wl = end - start; if (wl > 47) wl = 47;
+    char word[48]; memcpy(word, askgAnswer + start, wl); word[wl] = 0;
+    const int16_t wpx = wl * 12;
+    if (x + wpx > maxX && x > PAD) { x = PAD; y += lineH; if (y >= maxY) break; }
+    gfx->setTextColor(w == hl ? C_ACCENT : C_DIM);
+    gfx->setCursor(x, y); gfx->print(word);
+    x += wpx + 12;
+  }
+}
+
+/* Three rounded transport buttons, icons drawn from primitives (no icon font). */
+static void askgDrawButtons() {
+  for (int i = 0; i < 3; i++) {
+    const int16_t x = agBtnX(i), y = AG_BTN_Y, cx = x + AG_BTN_W / 2, cy = y + AG_BTN_H / 2;
+    gfx->fillRoundRect(x, y, AG_BTN_W, AG_BTN_H, 12, C_CARD);
+    if (i == 0) {                                   // play / pause
+      if (askgState == AG_PLAYING) {                // pause: two bars
+        gfx->fillRect(cx - 8, cy - 11, 6, 22, C_ACCENT);
+        gfx->fillRect(cx + 2, cy - 11, 6, 22, C_ACCENT);
+      } else {                                      // play: right triangle
+        gfx->fillTriangle(cx - 8, cy - 11, cx - 8, cy + 11, cx + 11, cy, C_ACCENT);
+      }
+    } else if (i == 1) {                            // stop: square
+      gfx->fillRect(cx - 10, cy - 10, 20, 20, C_HOT);
+    } else {                                        // restart: bar + left triangle
+      gfx->fillRect(cx - 12, cy - 11, 5, 22, C_ACCENT);
+      gfx->fillTriangle(cx + 11, cy - 11, cx + 11, cy + 11, cx - 6, cy, C_ACCENT);
+    }
+  }
+}
+
+static int askgButtonAt(uint16_t x, uint16_t y) {
+  if (y < AG_BTN_Y || y > AG_BTN_Y + AG_BTN_H) return -1;
+  for (int i = 0; i < 3; i++) if (x >= agBtnX(i) && x < agBtnX(i) + AG_BTN_W) return i;
+  return -1;
+}
+
+/* Blocking-but-interactive playback: chunk to I2S, update highlight, poll buttons. */
+static void askgPlay() {
+  if (!haveAudio || askgSamples == 0) return;
+  askgState = AG_PLAYING;
+  audioBusy = true;
+  es8311_voice_mute(codec, false);
+  digitalWrite(PA, HIGH);
+  delay(8);
+  askgDrawButtons();
+  int lastHl = -2;
+  bool muted = false;
+
+  while (askgState == AG_PLAYING || askgState == AG_PAUSED) {
+    const Gesture g = pollGesture();
+    if (g == G_TAP) {
+      const int b = askgButtonAt(tapX, tapY);
+      if (b == 0)      askgState = (askgState == AG_PLAYING) ? AG_PAUSED : AG_PLAYING;
+      else if (b == 1) askgState = AG_DONE;                 // stop
+      else if (b == 2) { askgPos = 0; askgState = AG_PLAYING; }  // restart
+      if (b >= 0) askgDrawButtons();
+    }
+
+    if (askgState == AG_PAUSED) {
+      if (!muted) { es8311_voice_mute(codec, true); digitalWrite(PA, LOW); muted = true; }
+      delay(20);
+      continue;
+    }
+    if (muted) { es8311_voice_mute(codec, false); digitalWrite(PA, HIGH); muted = false; delay(6); }
+
+    if (askgPos >= askgSamples) { askgState = AG_DONE; break; }
+    const size_t n = (askgSamples - askgPos < CHUNK) ? askgSamples - askgPos : CHUNK;
+    i2s.write((uint8_t *)(buffer + askgPos), n * sizeof(int16_t));
+    askgPos += n;
+
+    const uint32_t elapsed = (uint32_t)((uint64_t)(askgPos / CHANNELS) * 1000 / SAMPLE_RATE);
+    const int hl = askgWordAt(elapsed);
+    if (hl != lastHl) { lastHl = hl; askgPaintText(hl); }
+  }
+
+  es8311_voice_mute(codec, true);
+  digitalWrite(PA, LOW);
+  audioBusy = false;
+  askgPaintText(-1);              // clear the highlight when done/stopped
+  askgDrawButtons();
+}
+
+static void askgEnter() {
+  clearBody();
+  if (askgAnswer[0]) { askgPaintText(-1); askgDrawButtons(); }
+  else {
+    gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
+    gfx->setCursor(PAD, BODY_Y + 40);
+    gfx->print("hold BOOT to ask Grok");
+  }
+}
+
+static void askgTick(uint32_t) {}
+
+/* Taps when NOT mid-playback (answer sitting idle): the three buttons replay. */
+static void askgGesture(Gesture g) {
+  if (g != G_TAP || !askgAnswer[0]) return;
+  const int b = askgButtonAt(tapX, tapY);
+  if (b == 0 || b == 2) { askgPos = 0; askgPlay(); }   // play or restart
+}
+
+static void askgCapture(float secs) {
+  if (secs < 0.6f) { askgEnter(); return; }
+  askgState = AG_IDLE;
+  askgAnswer[0] = 0; askgWordCount = 0; askgSamples = 0;
+
+  gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, AG_BTN_Y - AG_TEXT_Y - 6, C_BG);
+  gfx->setTextSize(3); gfx->setTextColor(C_COOL);
+  gfx->setCursor(PAD, BODY_Y + 40); gfx->print("thinking...");
+
+  if (!netConsole.length() || !netConnect(8000)) {
+    gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, 40, C_BG);
+    gfx->setTextColor(C_HOT); gfx->setCursor(PAD, BODY_Y + 40); gfx->print("offline");
+    return;
+  }
+
+  // Mono upload, same as translate.
+  const size_t frames = recorded / CHANNELS;
+  for (size_t i = 0; i < frames; i++) buffer[i] = buffer[i * CHANNELS];
+  const size_t sent = frames * sizeof(int16_t);
+
+  HTTPClient http;
+  http.begin(netConsole + "/api/ask");
+  http.addHeader("Content-Type", "application/octet-stream");
+  if (netToken.length()) http.addHeader("Authorization", String("Bearer ") + netToken);
+  static const char *keep[] = { "X-Text-Len", "X-Audio-Format", "X-Error" };
+  http.collectHeaders(keep, 3);
+  http.setTimeout(45000);
+
+  const int code = http.POST((uint8_t *)buffer, sent);
+  if (code != 200) {
+    char err[80] = {0}; urlDecode(http.header("X-Error"), err, sizeof err);
+    http.end();
+    gfx->fillRect(PAD, AG_TEXT_Y, BODY_W, 60, C_BG);
+    gfx->setTextSize(2); gfx->setTextColor(C_HOT); gfx->setCursor(PAD, BODY_Y + 40);
+    gfx->print(err[0] ? err : "error");
+    LOGE("ask", "POST -> %d (%s)", code, err);
+    return;
+  }
+
+  const int textLen = http.header("X-Text-Len").toInt();
+  const String fmt = http.header("X-Audio-Format");
+  WiFiClient *stream = http.getStreamPtr();
+  const int total = http.getSize();
+
+  // 1. the answer text
+  int got = 0;
+  while (http.connected() && got < textLen && got < (int)sizeof(askgAnswer) - 1) {
+    const int avail = stream->available();
+    if (avail > 0) {
+      const int want = ((int)sizeof(askgAnswer) - 1 - got < avail) ? (int)sizeof(askgAnswer) - 1 - got : avail;
+      const int r = stream->readBytes((uint8_t *)askgAnswer + got, (textLen - got < want) ? textLen - got : want);
+      if (r <= 0) break; got += r;
+    } else delay(2);
+  }
+  askgAnswer[got] = 0;
+  askgIndexWords();
+
+  // 2. the audio, into the capture buffer
+  const size_t cap = MAX_SAMPLES * sizeof(int16_t);
+  const size_t audioTotal = (total > textLen) ? (size_t)total - textLen : 0;
+  size_t ab = 0; uint8_t *dst = (uint8_t *)buffer;
+  if (fmt.startsWith("pcm")) {
+    while (ab < cap && (audioTotal == 0 || ab < audioTotal)) {
+      const size_t avail = stream->available();
+      if (avail) {
+        const size_t want = (cap - ab < avail) ? cap - ab : avail;
+        const int r = stream->readBytes(dst + ab, want);
+        if (r <= 0) break; ab += r;
+      } else if (!http.connected()) break;
+      else delay(2);
+    }
+  }
+  http.end();
+  askgSamples = ab / sizeof(int16_t);
+  LOGI("ask", "answer %d chars, %u words, %u audio samples", got, askgWordCount, (unsigned)askgSamples);
+
+  askgPaintText(-1);
+  if (askgSamples) askgPlay();        // auto-read the answer
+  else askgDrawButtons();
+}
+
 /* ── the registry ─────────────────────────────────────────────────────────── */
 
 /* Slot 0 is the face and is full-bleed. The id stays `app.clock` even though it
@@ -1385,6 +1630,7 @@ static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY)
 static App APPS[] = {
   { "app.clock",    "Home",      "swipe up for apps",         faceEnter,     faceTick,     faceGesture,     nullptr,    true  },
   { "app.ask",      "Translate", "",                          askEnter,      askTick,      askGesture,      askCapture, false },
+  { "app.grok",     "Ask Grok",  "hold BOOT to ask",          askgEnter,     askgTick,     askgGesture,     askgCapture, false },
   { "app.settings", "Settings",  "tap a row \xB7 swipe down", settingsEnter, settingsTick, settingsGesture, nullptr,    false },
 };
 static constexpr int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);

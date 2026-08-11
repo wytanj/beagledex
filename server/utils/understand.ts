@@ -50,6 +50,19 @@ export interface Understanding {
   seconds: number      // audio duration if the provider reports it, else 0
 }
 
+/* Speech-to-text only (no translation) — used by /api/ask to hear the question. */
+export async function transcribeXai(a: Audio, key: string): Promise<{ text: string; seconds: number }> {
+  const fd = new FormData()
+  if (a.isPcm) { fd.append('audio_format', 'pcm'); fd.append('sample_rate', '16000') }
+  fd.append('file', new Blob([new Uint8Array(a.bytes)]), a.isPcm ? 'q.pcm' : `q.${a.ext}`)
+  const res = await fetch('https://api.x.ai/v1/stt', {
+    method: 'POST', headers: { Authorization: `Bearer ${key}` }, body: fd,
+  })
+  if (!res.ok) throw new Error(`stt ${res.status}: ${(await res.text()).slice(0, 200)}`)
+  const j = await res.json() as { text?: string; duration?: number }
+  return { text: (j.text ?? '').trim(), seconds: j.duration ? +j.duration.toFixed(2) : 0 }
+}
+
 /* ── grok (xAI): STT then chat ─────────────────────────────────────────────── */
 
 export async function understandXai(a: Audio, o: UnderstandOpts): Promise<Understanding> {
