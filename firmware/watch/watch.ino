@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.17.1";
+static const char *FW_VERSION = "0.17.2";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -1216,7 +1216,7 @@ static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY)
  * the id is a stable key, the meaning is allowed to move. */
 static App APPS[] = {
   { "app.clock",    "Home",      "swipe up for apps",         faceEnter,     faceTick,     faceGesture,     nullptr,    true  },
-  { "app.ask",      "Translate", "hold BOOT \xB7 tap a row",  askEnter,      askTick,      askGesture,      askCapture, false },
+  { "app.ask",      "Translate", "",                          askEnter,      askTick,      askGesture,      askCapture, false },
   { "app.settings", "Settings",  "tap a row \xB7 swipe down", settingsEnter, settingsTick, settingsGesture, nullptr,    false },
 };
 static constexpr int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
@@ -1262,8 +1262,11 @@ static void enterApp(int i) {
   launcherOpen = false;
   appIndex = (i + APP_COUNT) % APP_COUNT;
   if (!APPS[appIndex].fullscreen) {
-    // Chrome is redrawn on every entry because a full-bleed face (or the launcher)
-    // wipes it.
+    // Clear first: the chrome (status / title / body / hint) leaves a few pixels
+    // of gap between its regions, and without this those bands still show whatever
+    // was underneath — a sliver of a launcher card or the previous app. A
+    // full-bleed app paints the whole screen itself, so it does not need this.
+    gfx->fillScreen(C_BG);
     drawStatus();
     drawTitle();
     drawHint();
