@@ -26,6 +26,7 @@ const FONT_DIR = 'C:/Windows/Fonts/'
 const FAMILIES: Record<string, { family: string; file: string }> = {
   ja: { family: 'BDX-JA', file: 'YuGothM.ttc' },
   zh: { family: 'BDX-ZH', file: 'msyh.ttc' },
+  nan: { family: 'BDX-TW', file: 'msjh.ttc' },   // Hokkien: Traditional Han (JhengHei)
   ko: { family: 'BDX-KO', file: 'malgun.ttf' },
   th: { family: 'BDX-TH', file: 'LeelawUI.ttf' },
   ta: { family: 'BDX-IN', file: 'Nirmala.ttc' },   // Nirmala covers Tamil + Devanagari

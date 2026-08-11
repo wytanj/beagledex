@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.18.0";
+static const char *FW_VERSION = "0.19.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -729,11 +729,15 @@ static void faceGesture(Gesture g) {
  * because the direction is decided by the console from the detected language.
  * Say the far-side language and it comes back in yours. A toggle would be one
  * more thing to fumble mid-sentence. */
-struct Lang { const char *code; const char *label; };
+struct Lang { const char *code; const char *label; bool beta; };
 static const Lang LANGS[] = {
   {"en", "English"},  {"ja", "Japanese"}, {"zh", "Chinese"},    {"ko", "Korean"},
   {"es", "Spanish"},  {"fr", "French"},   {"de", "German"},     {"th", "Thai"},
   {"vi", "Vietnamese"}, {"id", "Indonesian"}, {"ms", "Malay"},  {"ta", "Tamil"},
+  // Low-resource: text translation is decent, spoken output is the weak link, and
+  // gemini is the likelier engine to voice it. Hence BETA. Han text renders via the
+  // Traditional CJK font on the host.
+  {"nan", "Hokkien", true},
 };
 static constexpr int LANG_COUNT = sizeof(LANGS) / sizeof(LANGS[0]);
 static int langA = 0, langB = 1;                  // A = you, B = the other speaker
@@ -792,10 +796,16 @@ static void trPaintRows() {
     gfx->setTextColor(C_DIM);
     gfx->setCursor(PAD + 12, y + 16);
     gfx->print(i == 0 ? "you" : "them");
+    const Lang &L = LANGS[i == 0 ? langA : langB];
     gfx->setTextSize(3);
     gfx->setTextColor(C_ACCENT);
     gfx->setCursor(PAD + 84, y + 12);
-    gfx->print(LANGS[i == 0 ? langA : langB].label);
+    gfx->print(L.label);
+    if (L.beta) {
+      gfx->setTextSize(1); gfx->setTextColor(C_WARN);
+      gfx->setCursor(PAD + 84 + (int)strlen(L.label) * 18 + 6, y + 12);
+      gfx->print("BETA");
+    }
     gfx->setTextSize(2);
     gfx->setTextColor(C_FAINT);
     gfx->setCursor(LCD_WIDTH - PAD - 22, y + 16);
@@ -822,6 +832,11 @@ static void pickerPaint() {
     gfx->setTextColor(sel ? C_BG : C_DIM);
     gfx->setCursor(x + 12, y + 12);
     gfx->print(LANGS[i].label);
+    if (LANGS[i].beta) {
+      gfx->setTextSize(1); gfx->setTextColor(sel ? C_BG : C_WARN);
+      gfx->setCursor(x + 12 + (int)strlen(LANGS[i].label) * 12 + 4, y + 12);
+      gfx->print("BETA");
+    }
   }
 }
 
@@ -1026,8 +1041,19 @@ static void askCapture(float secs) {
   }
 
   const uint32_t t0 = millis();
+  /* Halve the upload: the ES8311 is mono, so the right I2S slot is silence. Send
+   * only the left. Compact in place — the read index (2i) always leads the write
+   * index (i), so it is safe — and drop &channels so the console treats it as
+   * mono. This was fine to skip while signals were strong, but a 5 s capture is
+   * 320 KB of which half is zeros, and on a weak link that tips a request past its
+   * timeout. Less to send is also less radio-on time, i.e. less battery.
+   * lastPeak/rms were already measured (in captureWhileHeld) before this. */
+  const size_t frames = recorded / CHANNELS;
+  for (size_t i = 0; i < frames; i++) buffer[i] = buffer[i * CHANNELS];
+  const size_t sent = frames * sizeof(int16_t);
+
   String url = netConsole + "/api/translate?pair=" + LANGS[langA].code + "-"
-             + LANGS[langB].code + "&channels=2&speak=1&provider=" + PROVIDERS[provider];
+             + LANGS[langB].code + "&speak=1&provider=" + PROVIDERS[provider];
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/octet-stream");
@@ -1043,9 +1069,8 @@ static void askCapture(float secs) {
    * the console spends ~1.5 s on STT and translate and another ~1 s synthesising
    * speech, then streams the audio back down. Timing out mid-reply used to look
    * exactly like silence. */
-  http.setTimeout(30000);
+  http.setTimeout(45000);   // margin for a weak link and a longer capture
 
-  const size_t sent = recorded * sizeof(int16_t);
   const int code = http.POST((uint8_t *)buffer, sent);
 
   lastHttpCode = code;
@@ -1483,6 +1508,7 @@ static void captureWhileHeld() {
 
 static void doVoiceCapture() {
   if (!haveAudio) { LOGW("ptt", "no audio — capture skipped"); return; }
+  LOGI("ptt", "hold fired: app=%s power=%s busy=%d", APPS[appIndex].title, powerName(), (int)audioBusy);
 
   // Hold works from locked, like a phone's assistant button. Wake first so the
   // capture is visible, then never touch the panel again until it is done.
@@ -1504,7 +1530,10 @@ static void doVoiceCapture() {
   digitalWrite(PA, LOW);
 
   captureWhileHeld();
-  while (digitalRead(BOOT_BUTTON) == LOW) delay(10);
+  // Wait for release, but never forever — a flaky/stuck-low read must not freeze
+  // the whole watch on this screen (which would look exactly like "hold does nothing").
+  const uint32_t relT0 = millis();
+  while (digitalRead(BOOT_BUTTON) == LOW && millis() - relT0 < 60000) delay(10);
 
   // Deliberately stays muted with PA gated — see startAudio(). Nothing plays
   // back in the shell yet, and leaving the amp hot between captures was costing
@@ -1534,8 +1563,10 @@ static uint32_t btnDownAt = 0, btnLastTapAt = 0;
 
 static void onButtonTap() {
   noteActivity();
-  if (powerState != PWR_AWAKE) wakeScreen();   // wake
-  else                         lockNow();      // lock
+  // Asleep/dim -> wake. Awake -> nothing. A single press of the talk button used
+  // to lock the screen, which collides with a hold released a hair before 400 ms:
+  // you meant to talk, it locked. Lock now lives only in Settings.
+  if (powerState != PWR_AWAKE) wakeScreen();
 }
 
 static void onButtonDoubleTap() {

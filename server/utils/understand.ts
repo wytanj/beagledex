@@ -20,6 +20,9 @@ const LANGUAGE_NAMES: Record<string, string> = {
   fr: 'French', de: 'German', it: 'Italian', pt: 'Portuguese', ru: 'Russian',
   ar: 'Arabic', hi: 'Hindi', th: 'Thai', vi: 'Vietnamese', id: 'Indonesian',
   ms: 'Malay', ta: 'Tamil', nl: 'Dutch', tr: 'Turkish', pl: 'Polish',
+  // Spell it out for the models — a bare "nan" is not something they translate to
+  // reliably, and naming Tai-lo nudges toward usable romanisation.
+  nan: 'Taiwanese Hokkien (Min Nan; Han characters with Tai-lo romanisation)',
 }
 export const languageName = (c: string) => LANGUAGE_NAMES[c] ?? c
 
