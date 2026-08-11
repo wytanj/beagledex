@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.21.0";
+static const char *FW_VERSION = "0.22.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -803,10 +803,6 @@ static const char *langLabel(const char *code) {
 static char     trStatusText[20] = "READY";
 static uint16_t trStatusColour   = C_OK;
 
-/* Which understanding engine the console should use. A per-app toggle purely to
- * A/B real-world latency — tap the status band to switch. `provider` is declared
- * up with the net globals so netLoad() can restore it; persisted via
- * saveProvider() so a reboot mid-comparison doesn't reset it. */
 static const char *PROVIDERS[] = { "grok", "gemini" };
 static char     trTranscript[200] = {0};
 static char     trTranslation[200] = {0};
@@ -818,125 +814,103 @@ static size_t   lastSentBytes = 0;
 static size_t   lastBodyLen   = 0;
 static char     lastBodyHead[120] = {0};
 
-static constexpr int16_t TR_ROW_H = 56;      // the two "you/them" cards, enlarged
-static constexpr int16_t TR_TEXT_Y = BODY_Y + 2 * TR_ROW_H + 44;   // result / rendered-reply area
+/* Two screens. TALK is where you translate — status and the rendered reply get
+ * the whole body. SETUP is the language settings, two big selectors. Splitting
+ * them means neither is cramped: the talk workspace is roomy, and the selectors
+ * are as large as the screen allows. You bounce to SETUP only to change a
+ * language, then back. */
+enum TrScreen : uint8_t { TR_TALK, TR_SETUP };
+static TrScreen trScreen = TR_TALK;
 
-/* Full-screen language grid. Cycling forward through twelve languages meant a
- * careless tap had to be walked all the way around; a grid is direct selection,
- * with targets big enough not to mis-tap in the first place. -1 = closed, else
- * the side being chosen (0 = you, 1 = them). */
+/* SETUP: two big full-width selector cards + a button back to talk. (SEL_ prefix,
+ * not SET_ — the Settings app already owns SET_*.) */
+static constexpr int16_t SEL_CARD_H = 90;
+static constexpr int16_t SEL_Y0     = BODY_Y;
+static constexpr int16_t SEL_Y1     = BODY_Y + 98;
+static constexpr int16_t SEL_BTN_Y  = BODY_Y + 204;
+static constexpr int16_t SEL_BTN_H  = 64;
+
+/* TALK: compact header (pair + edit + engine), big status, roomy result. */
+static constexpr int16_t TALK_HDR_Y    = BODY_Y + 2;
+static constexpr int16_t TALK_ENG_Y    = BODY_Y + 30;
+static constexpr int16_t TALK_STATUS_Y = BODY_Y + 52;
+static constexpr int16_t TALK_TEXT_Y   = BODY_Y + 96;
+
+/* Single-column scrolling language picker (overlay over SETUP). One language per
+ * full-width row, big enough for a thumb; swipe to scroll the list. -1 closed,
+ * else the side being chosen (0 = you, 1 = them). */
 static int pickerFor = -1;
-/* Sized so the whole grid stays inside the body region (BODY_Y..BODY_Y+BODY_H),
- * which is all that clearBody() and askEnter() wipe. With 13 languages that's a
- * 7th row; at the old 47 px pitch the last cell fell BELOW the clear zone and its
- * remnant (Hokkien, the last tab) survived leaving the picker. 41 px keeps 7 rows
- * (up to 14 languages) fully inside — beyond that it would need to scroll. */
-static constexpr int16_t PK_TOP    = BODY_Y + 26;
-static constexpr int16_t PK_CELL_H = 41;
-static constexpr int16_t PK_CELL_W = (LCD_WIDTH - 2 * PAD - 8) / 2;   // two columns, small gap
-static constexpr int16_t PK_X1     = PAD + PK_CELL_W + 8;
+static int pickerTop = 0;                    // index of the first visible row
+static constexpr int16_t PK_TOP   = BODY_Y + 30;
+static constexpr int16_t PK_ROW_H = 46;
+static constexpr int     PK_VIS   = (BODY_H - (PK_TOP - BODY_Y)) / PK_ROW_H;
+static constexpr int     PK_MAXTOP = (LANG_COUNT > PK_VIS) ? (LANG_COUNT - PK_VIS) : 0;
 
-/* The built-in GFX font is ASCII. Japanese, Chinese, Korean and Thai would render
- * as mojibake, so the device speaks those replies instead of drawing them and the
- * screen shows only what it can. */
+/* The built-in GFX font is ASCII. Japanese/Chinese/Korean/Thai/Hokkien would
+ * render as mojibake, so those replies are spoken (and rendered to a bitmap by the
+ * console), never drawn from this font. */
 static bool renderable(const char *s) {
   for (const unsigned char *p = (const unsigned char *)s; *p; p++) if (*p >= 0x80) return false;
   return true;
 }
 
-/* The two selector cards. Bigger now, with the language in the accent colour and
- * a chevron to say they are tappable. */
-static void trPaintRows() {
-  for (int i = 0; i < 2; i++) {
-    const int16_t y = BODY_Y + i * TR_ROW_H;
-    gfx->fillRoundRect(PAD, y, BODY_W, TR_ROW_H - 8, 8, C_CARD);
-    gfx->setTextSize(2);
-    gfx->setTextColor(C_DIM);
-    gfx->setCursor(PAD + 12, y + 16);
-    gfx->print(i == 0 ? "you" : "them");
-    const Lang &L = LANGS[i == 0 ? langA : langB];
-    gfx->setTextSize(3);
-    gfx->setTextColor(C_ACCENT);
-    gfx->setCursor(PAD + 84, y + 12);
-    gfx->print(L.label);
-    if (L.beta) {
-      gfx->setTextSize(1); gfx->setTextColor(C_WARN);
-      gfx->setCursor(PAD + 84 + (int)strlen(L.label) * 18 + 6, y + 12);
-      gfx->print("BETA");
-    }
-    gfx->setTextSize(2);
-    gfx->setTextColor(C_FAINT);
-    gfx->setCursor(LCD_WIDTH - PAD - 22, y + 16);
-    gfx->print(">");
-  }
+static void betaTag(int16_t x, int16_t y, bool selBg) {
+  gfx->setTextSize(1); gfx->setTextColor(selBg ? C_BG : C_WARN);
+  gfx->setCursor(x, y); gfx->print("BETA");
 }
 
-/* The picker: a 2-column grid of every language, current one filled. Tap to
- * choose; tap the title to back out unchanged. */
-static void pickerPaint() {
+/* ── SETUP screen ─────────────────────────────────────────────────────────── */
+static void setupPaint() {
   clearBody();
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD, BODY_Y + 4);
-  gfx->printf("%s speaks:  (tap here to cancel)", pickerFor == 0 ? "you" : "them");
-
-  const int cur = pickerFor == 0 ? langA : langB;
-  for (int i = 0; i < LANG_COUNT; i++) {
-    // An odd count leaves the last language alone on its row — make it span the
-    // full width so it's a whole-row target, not a half-row with a dead right side
-    // nobody can tell isn't tappable.
-    const bool lastOdd = (i == LANG_COUNT - 1) && (LANG_COUNT & 1);
-    const int16_t x = lastOdd ? PAD : ((i & 1) ? PK_X1 : PAD);
-    const int16_t w = lastOdd ? BODY_W : PK_CELL_W;
-    const int16_t y = PK_TOP + (i / 2) * PK_CELL_H;
-    const bool sel = (i == cur);
-    gfx->fillRoundRect(x, y, w, PK_CELL_H - 7, 6, sel ? C_ACCENT : C_CARD);
-    gfx->setTextSize(2);
-    gfx->setTextColor(sel ? C_BG : C_DIM);
-    gfx->setCursor(x + 12, y + 12);
-    gfx->print(LANGS[i].label);
-    if (LANGS[i].beta) {
-      gfx->setTextSize(1); gfx->setTextColor(sel ? C_BG : C_WARN);
-      gfx->setCursor(x + 12 + (int)strlen(LANGS[i].label) * 12 + 4, y + 12);
-      gfx->print("BETA");
-    }
+  for (int i = 0; i < 2; i++) {
+    const int16_t y = i == 0 ? SEL_Y0 : SEL_Y1;
+    const Lang &L = LANGS[i == 0 ? langA : langB];
+    gfx->fillRoundRect(PAD, y, BODY_W, SEL_CARD_H, 10, C_CARD);
+    gfx->setTextSize(2); gfx->setTextColor(C_DIM);
+    gfx->setCursor(PAD + 16, y + 12); gfx->print(i == 0 ? "YOU" : "THEM");
+    gfx->setTextSize(4); gfx->setTextColor(C_ACCENT);
+    gfx->setCursor(PAD + 16, y + 42); gfx->print(L.label);
+    if (L.beta) betaTag(PAD + 16 + (int)strlen(L.label) * 24 + 8, y + 42, false);
+    gfx->setTextSize(3); gfx->setTextColor(C_FAINT);
+    gfx->setCursor(LCD_WIDTH - PAD - 26, y + SEL_CARD_H / 2 - 10); gfx->print(">");
   }
+  gfx->fillRoundRect(PAD, SEL_BTN_Y, BODY_W, SEL_BTN_H, 10, C_ACCENT);
+  gfx->setTextSize(3); gfx->setTextColor(C_BG);
+  gfx->setCursor(LCD_WIDTH / 2 - 54, SEL_BTN_Y + SEL_BTN_H / 2 - 11);
+  gfx->print("TALK \x10");                    // ▶
+}
+
+/* ── TALK screen ──────────────────────────────────────────────────────────── */
+static void talkHeaderPaint() {
+  gfx->fillRect(PAD, TALK_HDR_Y, BODY_W, 26, C_BG);
+  char a[8], b[8];
+  snprintf(a, sizeof a, "%s", LANGS[langA].code);
+  snprintf(b, sizeof b, "%s", LANGS[langB].code);
+  for (char *p = a; *p; p++) *p = toupper(*p);
+  for (char *p = b; *p; p++) *p = toupper(*p);
+  gfx->setTextSize(2); gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD, TALK_HDR_Y); gfx->printf("%s \x10 %s", a, b);
+  gfx->setTextColor(C_ACCENT);
+  gfx->setCursor(LCD_WIDTH - PAD - 108, TALK_HDR_Y); gfx->print("languages");
+
+  gfx->fillRect(PAD, TALK_ENG_Y, BODY_W, 16, C_BG);
+  gfx->setTextSize(1); gfx->setTextColor(C_ACCENT);
+  gfx->setCursor(PAD, TALK_ENG_Y); gfx->printf("engine:%s (tap)", PROVIDERS[provider]);
+  gfx->setTextColor(online ? C_OK : C_WARN);
+  gfx->setCursor(LCD_WIDTH - PAD - 42, TALK_ENG_Y); gfx->print(online ? "online" : "offline");
 }
 
 static void trPaintStatus() {
-  const int16_t y = BODY_Y + 2 * TR_ROW_H + 6;
-  gfx->fillRect(PAD, y, BODY_W, 30, C_BG);
-  gfx->setTextSize(3);
-  gfx->setTextColor(trStatusColour);
-  gfx->setCursor(PAD, y);
-  gfx->print(trStatusText);
-
-  // Right side, stacked: online state, and the engine (tap the band to switch).
-  gfx->setTextSize(1);
-  gfx->setTextColor(online ? C_OK : C_WARN);
-  gfx->setCursor(LCD_WIDTH - PAD - 60, y);
-  gfx->print(online ? "online" : "offline");
-  gfx->setTextColor(C_ACCENT);
-  gfx->setCursor(LCD_WIDTH - PAD - 60, y + 14);
-  gfx->printf("engine:%s", PROVIDERS[provider]);
+  gfx->fillRect(PAD, TALK_STATUS_Y, BODY_W, 34, C_BG);
+  gfx->setTextSize(3); gfx->setTextColor(trStatusColour);
+  gfx->setCursor(PAD, TALK_STATUS_Y); gfx->print(trStatusText);
 }
 
 static void trPaintText() {
-  const int16_t y = BODY_Y + 2 * TR_ROW_H + 44;
+  const int16_t y = TALK_TEXT_Y;
   gfx->fillRect(PAD, y, BODY_W, BODY_Y + BODY_H - y, C_BG);
   int16_t cy = y;
-
-  /* This device speaks its replies, so the screen is confirmation, not output. It
-   * shows only what the ASCII font can actually draw — the near-side transcript
-   * when that side is Latin — and never tries to render the foreign reply, because
-   * you just heard it. A "this script needs rendering" warning over a translation
-   * the speaker already heard aloud is noise pretending to be an error. */
-  if (trTranscript[0] && renderable(trTranscript)) {
-    drawWrapped(trTranscript, PAD, cy, y + 80, C_DIM);
-    cy += 84;
-  }
-  // A Latin-script reply (Spanish, French, …) is worth showing too; a non-Latin
-  // one was spoken and is deliberately not drawn.
+  if (trTranscript[0] && renderable(trTranscript)) { drawWrapped(trTranscript, PAD, cy, y + 84, C_DIM); cy += 88; }
   if (trTranslation[0] && renderable(trTranslation)) {
     drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
   } else if (trNote[0]) {
@@ -944,37 +918,70 @@ static void trPaintText() {
   }
 }
 
-static void askStatus(const char *s, uint16_t colour) {   // kept: the shell calls this
+/* ── picker ───────────────────────────────────────────────────────────────── */
+static void pickerPaint() {
+  clearBody();
+  gfx->setTextSize(2); gfx->setTextColor(C_DIM);
+  gfx->setCursor(PAD, BODY_Y + 4); gfx->printf("%s speaks", pickerFor == 0 ? "you" : "them");
+  gfx->setTextColor(C_FAINT);
+  gfx->setCursor(LCD_WIDTH - PAD - 60, BODY_Y + 4); gfx->print("cancel");
+
+  const int cur = pickerFor == 0 ? langA : langB;
+  for (int r = 0; r < PK_VIS; r++) {
+    const int i = pickerTop + r;
+    if (i >= LANG_COUNT) break;
+    const int16_t y = PK_TOP + r * PK_ROW_H;
+    const bool sel = (i == cur);
+    gfx->fillRoundRect(PAD, y, BODY_W, PK_ROW_H - 6, 8, sel ? C_ACCENT : C_CARD);
+    gfx->setTextSize(3); gfx->setTextColor(sel ? C_BG : C_DIM);
+    gfx->setCursor(PAD + 16, y + 9); gfx->print(LANGS[i].label);
+    if (LANGS[i].beta) betaTag(PAD + 16 + (int)strlen(LANGS[i].label) * 18 + 8, y + 9, sel);
+  }
+  // Scroll arrows so it's clear there's more than fits.
+  gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
+  if (pickerTop > 0)               { gfx->setCursor(LCD_WIDTH - PAD - 14, PK_TOP);              gfx->print("\x18"); }
+  if (pickerTop < PK_MAXTOP)       { gfx->setCursor(LCD_WIDTH - PAD - 14, BODY_Y + BODY_H - 20); gfx->print("\x19"); }
+}
+
+static void askStatus(const char *s, uint16_t colour) {   // the shell calls this on capture
   snprintf(trStatusText, sizeof trStatusText, "%s", s);
   trStatusColour = colour;
-  trPaintStatus();
+  // A capture always belongs on the talk screen — snap to it from setup/picker.
+  if (pickerFor >= 0 || trScreen != TR_TALK) { pickerFor = -1; trScreen = TR_TALK; askEnter(); }
+  else trPaintStatus();
 }
 
 static void askEnter() {
   clearBody();
   if (pickerFor >= 0) { pickerPaint(); return; }
-  trPaintRows();
+  if (trScreen == TR_SETUP) { setupPaint(); return; }
+  talkHeaderPaint();
   if (!haveAudio) { snprintf(trStatusText, sizeof trStatusText, "NO AUDIO"); trStatusColour = C_HOT; }
   trPaintStatus();
   if (!trTranscript[0] && !trTranslation[0] && !trNote[0])
-    snprintf(trNote, sizeof trNote, "tap a language, or hold BOOT to talk");
+    snprintf(trNote, sizeof trNote, "hold BOOT to talk");
   trPaintText();
 }
 
 static void askTick(uint32_t) {}
 
-static void askGesture(Gesture g) {
-  if (g != G_TAP) return;
+static void pickerScroll(int delta) {
+  int t = pickerTop + delta;
+  if (t < 0) t = 0;
+  if (t > PK_MAXTOP) t = PK_MAXTOP;
+  if (t != pickerTop) { pickerTop = t; pickerPaint(); }
+}
 
-  if (pickerFor >= 0) {                              // choosing a language
+static void askGesture(Gesture g) {
+  if (pickerFor >= 0) {                              // picker is modal (see the loop)
+    if (g == G_SWIPE_U) { pickerScroll(PK_VIS - 1); return; }
+    if (g == G_SWIPE_D) { pickerScroll(-(PK_VIS - 1)); return; }
+    if (g != G_TAP) return;
     if (tapY < PK_TOP) { pickerFor = -1; askEnter(); return; }   // title = cancel
-    const int col = tapX < PK_X1 ? 0 : 1;
-    const int row = (tapY - PK_TOP) / PK_CELL_H;
-    int idx = row * 2 + col;
-    // The lone full-width last cell (odd count) is selectable from either column.
-    if ((LANG_COUNT & 1) && idx == LANG_COUNT) idx = LANG_COUNT - 1;
-    if (idx >= 0 && idx < LANG_COUNT) {
-      if (pickerFor == 0) langA = idx; else langB = idx;
+    const int row = (tapY - PK_TOP) / PK_ROW_H;
+    const int i = pickerTop + row;
+    if (row >= 0 && row < PK_VIS && i >= 0 && i < LANG_COUNT) {
+      if (pickerFor == 0) langA = i; else langB = i;
       LOGI("translate", "pair %s-%s", LANGS[langA].code, LANGS[langB].code);
     }
     pickerFor = -1;
@@ -982,18 +989,30 @@ static void askGesture(Gesture g) {
     return;
   }
 
-  // main view: a card opens its picker; the status band toggles the engine; a tap
-  // in the result area below clears the last result.
-  if (tapY < BODY_Y + TR_ROW_H)          { pickerFor = 0; askEnter(); }
-  else if (tapY < BODY_Y + 2 * TR_ROW_H) { pickerFor = 1; askEnter(); }
-  else if (tapY < TR_TEXT_Y) {                        // the status band
+  if (g != G_TAP) return;
+
+  if (trScreen == TR_SETUP) {
+    if (tapY >= SEL_Y0 && tapY < SEL_Y0 + SEL_CARD_H) {
+      pickerFor = 0; pickerTop = langA > PK_MAXTOP ? PK_MAXTOP : langA; askEnter();
+    } else if (tapY >= SEL_Y1 && tapY < SEL_Y1 + SEL_CARD_H) {
+      pickerFor = 1; pickerTop = langB > PK_MAXTOP ? PK_MAXTOP : langB; askEnter();
+    } else if (tapY >= SEL_BTN_Y) {
+      trScreen = TR_TALK; askEnter();
+    }
+    return;
+  }
+
+  // TALK: header → edit languages; engine row → toggle; result area → clear.
+  if (tapY < TALK_ENG_Y) {
+    trScreen = TR_SETUP; askEnter();
+  } else if (tapY < TALK_STATUS_Y) {
     provider = (provider + 1) % (int)(sizeof(PROVIDERS) / sizeof(PROVIDERS[0]));
     saveProvider();
     LOGI("translate", "engine %s", PROVIDERS[provider]);
-    trPaintStatus();
+    talkHeaderPaint();
   } else {
     trTranscript[0] = trTranslation[0] = 0;
-    snprintf(trNote, sizeof trNote, "hold BOOT, speak, release");
+    snprintf(trNote, sizeof trNote, "hold BOOT to talk");
     trPaintText();
   }
 }
@@ -1073,7 +1092,8 @@ static void playPcm(const int16_t *pcm, size_t samples) {
 
 static void askCapture(float secs) {
   trTranscript[0] = trTranslation[0] = 0;
-  if (pickerFor >= 0) { pickerFor = -1; clearBody(); trPaintRows(); }  // results need the main view
+  // A result belongs on the talk screen; snap there from setup/picker.
+  if (pickerFor >= 0 || trScreen != TR_TALK) { pickerFor = -1; trScreen = TR_TALK; askEnter(); }
 
   /* Distinguish "you let go too early" from "the microphone heard nothing". Both
    * used to say SILENT, which sent me hunting a hardware fault that did not
@@ -1178,7 +1198,7 @@ static void askCapture(float secs) {
     const size_t textBytes = (size_t)tw * th * 2;
 
     askStatus("SPEAKING", C_ACCENT);
-    gfx->fillRect(PAD, TR_TEXT_Y, BODY_W, BODY_Y + BODY_H - TR_TEXT_Y, C_BG);
+    gfx->fillRect(PAD, TALK_TEXT_Y, BODY_W, BODY_Y + BODY_H - TALK_TEXT_Y, C_BG);
 
     // 1. the rendered reply
     if (tw > 0 && th > 0 && textBytes <= cap) {
@@ -1192,7 +1212,7 @@ static void askCapture(float secs) {
           got += r;
         } else delay(2);
       }
-      if (got == textBytes) gfx->draw16bitRGBBitmap(PAD, TR_TEXT_Y, (uint16_t *)buffer, tw, th);
+      if (got == textBytes) gfx->draw16bitRGBBitmap(PAD, TALK_TEXT_Y, (uint16_t *)buffer, tw, th);
     }
 
     // 2. the audio, over the same buffer
@@ -1379,6 +1399,7 @@ static void drawHint() {
 
 static void enterApp(int i) {
   launcherOpen = false;
+  pickerFor = -1;          // the Translate picker is modal; never leave it open across a switch
   appIndex = (i + APP_COUNT) % APP_COUNT;
   if (!APPS[appIndex].fullscreen) {
     // Clear first: the chrome (status / title / body / hint) leaves a few pixels
@@ -1819,7 +1840,8 @@ static void handleCommand(char *line) {
     // Length only. Never log the password — this line lands in the console's store.
     LOGI("net", "network %u/%d: %s (%u-char pass)", netCount, NET_MAX, ssid.c_str(), pass.length());
     netConnect(12000);
-    if (powerState != PWR_OFF && !launcherOpen && APPS[appIndex].onCapture == askCapture) trPaintStatus();
+    if (powerState != PWR_OFF && !launcherOpen && pickerFor < 0 && trScreen == TR_TALK
+        && APPS[appIndex].onCapture == askCapture) talkHeaderPaint();
   }
   else if (!strncmp(line, ">console ", 9)) {
     netConsole = line + 9; netSave("console", netConsole);
@@ -2015,10 +2037,15 @@ void loop() {
     if (powerState == PWR_DIM) wakeScreen();   // first gesture only un-dims
 
     /* One consistent axis: swipe UP for the app menu, swipe DOWN for the face.
-     * Everything else is the app's own. No more swipe-through ring. */
+     * Everything else is the app's own. Exception: the language picker is modal —
+     * while it's open it consumes ALL gestures (taps to choose, swipes to scroll),
+     * so up/down don't escape to the launcher/face mid-selection. Only Translate
+     * ever sets pickerFor, so this stays scoped to it. */
     if (launcherOpen) {
       if (g == G_SWIPE_D)      enterApp(0);             // back to the face
       else if (g == G_TAP)     launcherTap(tapX, tapY);
+    } else if (pickerFor >= 0) {
+      APPS[appIndex].onGesture(g);                      // picker owns the gesture
     } else if (g == G_SWIPE_U) {
       openLauncher();
     } else if (g == G_SWIPE_D && appIndex != 0) {
@@ -2039,7 +2066,8 @@ void loop() {
       netWas = online;
       if (online) LOGI("net", "online, ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
       else        LOGW("net", "offline");
-      if (!launcherOpen && APPS[appIndex].onCapture == askCapture) trPaintStatus();
+      if (!launcherOpen && pickerFor < 0 && trScreen == TR_TALK
+          && APPS[appIndex].onCapture == askCapture) talkHeaderPaint();
     }
   }
 
