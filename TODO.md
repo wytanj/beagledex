@@ -121,7 +121,77 @@ npm run push time            # set the RTC from this machine's clock
 8. **Light sleep**, once (1) gives the device a transport other than USB serial. See the
    power notes below; it is the ~50× lever, worth far more than every other item here.
 
-## The next real blocker: CJK text cannot be drawn
+## Scripts: Chinese is easy, Arabic and Sanskrit are a different problem
+
+These three are not equally hard, and the difference decides the architecture.
+
+| Script | Glyphs needed | Layout complexity | Renderable on device? |
+|---|---|---|---|
+| Chinese / Japanese / Korean | thousands | **none** — fixed boxes, left to right | yes, with a bitmap font |
+| Arabic | ~28 letters | **high** — RTL, 4 contextual forms per letter, mandatory ligatures | no |
+| Sanskrit (Devanagari) | ~50 base | **highest** — conjuncts, matra reordering, joined top bar | no |
+
+**CJK is a storage problem.** Each character is a fixed-width box drawn left to
+right with no context sensitivity, so a 16x16 bitmap font plus a blit loop is
+genuinely enough. Unifont in the storage partition would cover it offline.
+
+**Arabic is a layout problem.** Every letter has up to four shapes depending on its
+neighbours (isolated / initial / medial / final), lam-alef is a required ligature,
+and the whole run is right to left with digits still left to right. A font alone
+cannot do this — the shaping is an algorithm, not a glyph table.
+
+**Devanagari is worse.** Consonant clusters fuse into conjuncts (क् + ष becomes
+क्ष, hundreds of them), vowel signs attach above, below, after *and before* the
+consonant they follow phonetically — the short-i matra is written to the LEFT of a
+letter it comes after — so correct output needs reordering before rasterising.
+
+So host-side rendering is not a convenience for these scripts, it is the only
+correct answer. Reimplementing Unicode bidi and OpenType shaping on an ESP32 is
+not a font exercise, it is porting HarfBuzz.
+
+### What this machine already has
+
+Fonts: all present. `Nirmala.ttc` (Devanagari), `arial/tahoma/segoeui` (Arabic),
+`msyh/simsun` (Chinese), `msgothic/YuGothic` (Japanese), `malgun` (Korean).
+
+Shaping: **missing.** `PIL.features.check('raqm')` is **False**, so Pillow does
+BASIC layout only. It will render Chinese correctly and will silently render Arabic
+as disconnected left-to-right letters and Devanagari without conjuncts — wrong in a
+way that looks like a rendering bug rather than a missing library.
+
+### Recommended route
+
+1. **Headless Chromium via Playwright** for the text strip. A browser brings
+   HarfBuzz, FriBidi, line breaking, font fallback and emoji, all correct, and this
+   is already a Node project. Costs a ~150 MB chromium download.
+2. **Or `uharfbuzz` + `freetype-py`** — pip wheels exist for Windows, no browser,
+   about a hundred lines to shape then rasterise glyph by glyph.
+3. **Ship CJK first** with plain Pillow and the fonts already installed, since it
+   needs no shaping at all. Arabic and Devanagari follow once (1) or (2) is in.
+
+### Wire format for the strip
+
+Return an **alpha mask, not RGB565**. 368x120 at 8-bit alpha is 44 KB versus 88 KB,
+at 4-bit it is 22 KB, and the device composites it with whatever colour the app
+wants — so one code path themes every script. 1-bit is 5.5 KB but loses the
+antialiasing that small CJK and Devanagari actually need.
+
+This also lands exactly on the original frozen contract for `/api/translate`: body
+is the renderable payload, text in the `X-Transcript` / `X-Translation` headers. It
+was written for PCM going to I2S; pixels going to the panel is the same shape.
+
+Rendered strips also cache perfectly, keyed by hash of text plus font plus size —
+which is what the microSD card is for, and how the offline phrase cache should work.
+
+### Sanskrit specifically
+
+Rendering Devanagari is solvable as above. The harder question is the speech leg:
+xAI's STT covers 25 languages and Sanskrit is unlikely to be among them, while
+Hindi almost certainly is. Translation quality for Sanskrit will also be far weaker
+than for a high-resource language. Check STT language support before assuming the
+bottleneck is the font.
+
+## The current blocker: CJK text cannot be drawn
 
 Arduino_GFX's built-in font is ASCII. Japanese, Chinese, Korean and Thai render as
 mojibake, which looks like a fault rather than a missing feature — so the Translate
