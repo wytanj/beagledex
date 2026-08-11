@@ -78,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.16.0";
+static const char *FW_VERSION = "0.17.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -545,9 +545,13 @@ static void drawWrapped(const char *s, int16_t x, int16_t y, int16_t maxY, uint1
 
 /* ── app state ────────────────────────────────────────────────────────────── */
 
-static int  appIndex  = 0;
-static bool audioBusy = false;        // set across capture; blocks every repaint
-static bool qsOpen    = false;        // quick settings panel
+static int  appIndex     = 0;
+static bool audioBusy    = false;     // set across capture; blocks every repaint
+static bool launcherOpen = false;     // the app-grid home menu is showing
+
+/* Defined in the power section, but the Settings app (declared before it) has a
+ * "lock now" row that calls it. */
+static void lockNow();
 
 /* ── the watch face ───────────────────────────────────────────────────────────
  * The face is DATA, not code. A background image plus a descriptor saying where
@@ -1130,30 +1134,80 @@ static const char *powerName() {
   }
 }
 
-static void sysPaint() {
-  clearBody();
+/* ── app: settings ────────────────────────────────────────────────────────────
+ * Everything that used to be the swipe-down quick panel plus the System readout,
+ * now a real app you open from the launcher. Four tappable control rows, then a
+ * live info block below them. This is where a per-device config UI will eventually
+ * mirror what the console pushes.
+ */
+static constexpr int16_t SET_ROW_H = 46;
+static constexpr int16_t SET_Y0    = BODY_Y + 2;
+
+static void settingsRows() {
+  char b[4][40];
+  snprintf(b[0], 40, "brightness   %3u", brightFull);
+  if (aodAfterMs) snprintf(b[1], 40, "rest after   %lu s", (unsigned long)(aodAfterMs / 1000));
+  else            snprintf(b[1], 40, "rest after   never");
+  snprintf(b[2], 40, "always-on    %s", aodEnabled ? "on" : "off");
+  snprintf(b[3], 40, "lock now");
+  for (int i = 0; i < 4; i++) {
+    const int16_t y = SET_Y0 + i * SET_ROW_H;
+    gfx->fillRoundRect(PAD, y, BODY_W, SET_ROW_H - 6, 8, C_CARD);
+    gfx->setTextSize(2); gfx->setTextColor(C_ACCENT);
+    gfx->setCursor(PAD + 12, y + 12);
+    gfx->print(b[i]);
+  }
+}
+
+static void settingsInfo() {
+  const int16_t y0 = SET_Y0 + 4 * SET_ROW_H + 4;
+  gfx->fillRect(PAD, y0, BODY_W, BODY_Y + BODY_H - y0, C_BG);
   gfx->setTextSize(2); gfx->setTextColor(C_DIM);
-  int16_t y = BODY_Y + 2;
+  int16_t y = y0;
   const int bat = batteryPct();
-  gfx->setCursor(PAD, y); gfx->printf("fw      %s", FW_VERSION);                        y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("device  %s", deviceId);                          y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("up      %lu s", millis() / 1000);                y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("heap    %u KB", ESP.getFreeHeap() / 1024);       y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("psram   %u KB", ESP.getFreePsram() / 1024);      y += 24;
-  if (bat >= 0) { gfx->setCursor(PAD, y); gfx->printf("battery %d%%", bat); }
-  else          { gfx->setCursor(PAD, y); gfx->print("battery --  unverified"); }
+  gfx->setCursor(PAD, y); gfx->printf("fw %s   %s", FW_VERSION, haveAudio ? "audio ok" : "no audio"); y += 24;
+  gfx->setCursor(PAD, y);
+  if (bat >= 0) gfx->printf("battery %d%%   up %lus", bat, millis() / 1000);
+  else          gfx->printf("battery --   up %lus", millis() / 1000);
   y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("power   %s", powerName());                       y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("sleep   %lu s", (unsigned long)(offAfterMs / 1000)); y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("audio   %s", haveAudio ? "up" : "down");         y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("card    %s", cacheReady() ? "ready" : "none");   y += 24;
-  gfx->setCursor(PAD, y); gfx->printf("pmic    %02X %02X %02X", pmicIrq[0], pmicIrq[1], pmicIrq[2]);
+  gfx->setCursor(PAD, y); gfx->printf("net %s", online ? WiFi.SSID().c_str() : "offline"); y += 24;
+  gfx->setCursor(PAD, y); gfx->printf("free %uK  card %s", ESP.getFreePsram() / 1024, cacheReady() ? "in" : "none");
 }
-static void sysEnter() { sysPaint(); }
-static void sysTick(uint32_t now) {
+
+static void settingsTap(uint16_t x, uint16_t y) {
+  if (y < SET_Y0 || y >= SET_Y0 + 4 * SET_ROW_H) return;
+  switch ((y - SET_Y0) / SET_ROW_H) {
+    case 0: {                                   // brightness: left half down, right half up
+      int v = (int)brightFull + (x < LCD_WIDTH / 2 ? -32 : 32);
+      if (v < 32) v = 32; if (v > 255) v = 255;
+      brightFull = (uint8_t)v;
+      gfx->setBrightness(brightFull);
+      LOGI("pwr", "brightness %u", brightFull);
+      break;
+    }
+    case 1:                                     // rest timeout, cycling
+      if      (aodAfterMs == 30000)  aodAfterMs = 60000;
+      else if (aodAfterMs == 60000)  aodAfterMs = 300000;
+      else if (aodAfterMs == 300000) aodAfterMs = 0;
+      else                           aodAfterMs = 30000;
+      if (aodAfterMs && dimAfterMs > aodAfterMs / 2) dimAfterMs = aodAfterMs / 2;
+      LOGI("pwr", "rest after %lu ms", (unsigned long)aodAfterMs);
+      break;
+    case 2:
+      aodEnabled = !aodEnabled;
+      LOGI("pwr", "always-on %s", aodEnabled ? "on" : "off");
+      break;
+    case 3: lockNow(); return;                  // screen goes off; nothing to repaint
+  }
+  settingsRows();
+}
+
+static void settingsEnter() { clearBody(); settingsRows(); settingsInfo(); }
+static void settingsTick(uint32_t now) {
   static uint32_t last = 0;
-  if (now - last > 2000) { last = now; sysPaint(); }
+  if (now - last > 2000) { last = now; settingsInfo(); }
 }
+static void settingsGesture(Gesture g) { if (g == G_TAP) settingsTap(tapX, tapY); }
 
 /* ── the registry ─────────────────────────────────────────────────────────── */
 
@@ -1161,9 +1215,9 @@ static void sysTick(uint32_t now) {
  * now means considerably more than a clock — same reasoning as audio.loopback:
  * the id is a stable key, the meaning is allowed to move. */
 static App APPS[] = {
-  { "app.clock",  "Face",   "tap for the photo",         faceEnter,  faceTick,  faceGesture, nullptr,    true  },
-  { "app.ask",    "Translate", "hold BOOT \xB7 tap a row",  askEnter, askTick, askGesture, askCapture, false },
-  { "app.system", "System", "swipe down for settings",   sysEnter,   sysTick,   nullptr,     nullptr,    false },
+  { "app.clock",    "Face",      "swipe up for apps",         faceEnter,     faceTick,     faceGesture,     nullptr,    true  },
+  { "app.ask",      "Translate", "hold BOOT \xB7 tap a row",  askEnter,      askTick,      askGesture,      askCapture, false },
+  { "app.settings", "Settings",  "tap a row \xB7 swipe down", settingsEnter, settingsTick, settingsGesture, nullptr,    false },
 };
 static constexpr int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
 
@@ -1190,27 +1244,26 @@ static void drawTitle() {
   gfx->fillRect(0, TITLE_Y, LCD_WIDTH, 36, C_BG);
   gfx->setTextSize(3); gfx->setTextColor(C_ACCENT);
   gfx->setCursor(PAD, TITLE_Y);
-  gfx->print(qsOpen ? "Settings" : APPS[appIndex].title);
-
-  if (!qsOpen) {
-    const int16_t dx = LCD_WIDTH - PAD - APP_COUNT * 16;
-    for (int i = 0; i < APP_COUNT; i++)
-      gfx->fillCircle(dx + i * 16, TITLE_Y + 14, 4, i == appIndex ? C_ACCENT : C_FAINT);
-  }
+  gfx->print(APPS[appIndex].title);
+  // A small up-chevron as the standing reminder that apps live one swipe up.
+  gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
+  gfx->setCursor(LCD_WIDTH - PAD - 16, TITLE_Y + 6);
+  gfx->print("\x18");                         // ▲
 }
 
 static void drawHint() {
   gfx->fillRect(0, HINT_Y, LCD_WIDTH, 24, C_BG);
   gfx->setTextSize(2); gfx->setTextColor(C_FAINT);
   gfx->setCursor(PAD, HINT_Y);
-  gfx->print(qsOpen ? "swipe up to close" : APPS[appIndex].hint);
+  gfx->print(APPS[appIndex].hint);
 }
 
 static void enterApp(int i) {
-  qsOpen = false;
+  launcherOpen = false;
   appIndex = (i + APP_COUNT) % APP_COUNT;
   if (!APPS[appIndex].fullscreen) {
-    // Chrome is redrawn on every entry because a full-bleed face wipes it.
+    // Chrome is redrawn on every entry because a full-bleed face (or the launcher)
+    // wipes it.
     drawStatus();
     drawTitle();
     drawHint();
@@ -1319,81 +1372,48 @@ static void lockNow() {
   LOGI("pwr", "locked");
 }
 
-/* ── quick settings ───────────────────────────────────────────────────────────
- * Swipe down from the status strip. Rows are fixed-height so a tap maps to a row
- * by arithmetic rather than a hit-test table.
+/* ── the launcher (home menu) ──────────────────────────────────────────────────
+ * The app grid. Swipe up from anywhere to open it, tap a tile to launch, swipe
+ * down to drop back to the face. This replaces the old swipe-through ring: with a
+ * fourth app coming (the agent), cycling was already the wrong shape. Tiles are
+ * a 2-column grid so it scales to six apps before it ever needs to scroll.
  */
-static constexpr int16_t QS_ROW_H = 52;
-static constexpr int16_t QS_Y0    = BODY_Y + 40;
+static constexpr int16_t LN_TOP  = 72;
+static constexpr int16_t LN_GAP  = 10;
+static constexpr int16_t LN_CW   = (LCD_WIDTH - 2 * PAD - LN_GAP) / 2;
+static constexpr int16_t LN_CH   = 100;
 
-static void qsPaint() {
-  clearBody();
+static void launcherPaint() {
+  gfx->fillScreen(C_BG);
   gfx->setTextSize(2); gfx->setTextColor(C_DIM);
-  gfx->setCursor(PAD, BODY_Y + 6);
-  gfx->print("tap a row to change");
+  gfx->setCursor(PAD, 20);
+  gfx->print("Apps");
+  gfx->setTextColor(C_FAINT);
+  gfx->setCursor(LCD_WIDTH - PAD - 108, 20);
+  gfx->print("swipe down \x19");             // ▼ back to the face
 
-  const char *labels[4];
-  char b0[40], b1[40], b2[40], b3[40];
-  snprintf(b0, sizeof b0, "brightness   %3u", brightFull);
-  if (aodAfterMs) snprintf(b1, sizeof b1, "rest after   %lu s", (unsigned long)(aodAfterMs / 1000));
-  else            snprintf(b1, sizeof b1, "rest after   never");
-  snprintf(b2, sizeof b2, "always-on    %s", aodEnabled ? "on" : "off");
-  snprintf(b3, sizeof b3, "lock now");
-  labels[0] = b0; labels[1] = b1; labels[2] = b2; labels[3] = b3;
-
-  for (int i = 0; i < 4; i++) {
-    const int16_t y = QS_Y0 + i * QS_ROW_H;
-    gfx->fillRoundRect(PAD, y, BODY_W, QS_ROW_H - 8, 8, C_CARD);
-    gfx->setTextSize(2);
-    gfx->setTextColor(i == 3 ? C_FAINT : C_ACCENT);   // audio row is read-only
-    gfx->setCursor(PAD + 12, y + 14);
-    gfx->print(labels[i]);
+  for (int i = 0; i < APP_COUNT; i++) {
+    const int16_t x = PAD + (i & 1) * (LN_CW + LN_GAP);
+    const int16_t y = LN_TOP + (i / 2) * (LN_CH + LN_GAP);
+    gfx->fillRoundRect(x, y, LN_CW, LN_CH, 12, C_CARD);
+    gfx->setTextSize(3); gfx->setTextColor(C_ACCENT);
+    gfx->setCursor(x + 14, y + LN_CH / 2 - 10);
+    gfx->print(APPS[i].title);
   }
-  gfx->setTextSize(1); gfx->setTextColor(C_FAINT);
-  gfx->setCursor(PAD, QS_Y0 + 4 * QS_ROW_H + 6);
-  gfx->print("brightness: tap left half to lower, right half to raise");
 }
 
-static void qsOpenPanel() {
-  qsOpen = true;
-  drawTitle();
-  drawHint();
-  qsPaint();
-  LOGI("shell", "quick settings");
+static void openLauncher() {
+  launcherOpen = true;
+  launcherPaint();
+  LOGI("shell", "launcher");
 }
 
-static void qsHandleTap(uint16_t x, uint16_t y) {
-  if (y < QS_Y0) return;
-  const int row = (y - QS_Y0) / QS_ROW_H;
-  switch (row) {
-    case 0: {                                   // brightness, left down / right up
-      const int step = 64;
-      int v = (int)brightFull + (x < LCD_WIDTH / 2 ? -step : step);
-      if (v < 32)  v = 32;                      // never let the user blind themselves
-      if (v > 255) v = 255;
-      brightFull = (uint8_t)v;
-      gfx->setBrightness(brightFull);
-      LOGI("pwr", "brightness %u", brightFull);
-      break;
-    }
-    case 1: {                                   // how long before it rests
-      if      (aodAfterMs == 30000)  aodAfterMs = 60000;
-      else if (aodAfterMs == 60000)  aodAfterMs = 300000;
-      else if (aodAfterMs == 300000) aodAfterMs = 0;
-      else                           aodAfterMs = 30000;
-      if (aodAfterMs && dimAfterMs > aodAfterMs / 2) dimAfterMs = aodAfterMs / 2;
-      LOGI("pwr", "rest after %lu ms, dim after %lu ms",
-           (unsigned long)aodAfterMs, (unsigned long)dimAfterMs);
-      break;
-    }
-    case 2:                                     // always-on face on/off
-      aodEnabled = !aodEnabled;
-      LOGI("pwr", "always-on %s", aodEnabled ? "on" : "off");
-      break;
-    case 3: lockNow(); return;                  // no repaint: the screen is off
-    default: return;
-  }
-  qsPaint();
+static void launcherTap(uint16_t x, uint16_t y) {
+  if (y < LN_TOP) return;
+  const int row = (y - LN_TOP) / (LN_CH + LN_GAP);
+  const int col = x < PAD + LN_CW + LN_GAP / 2 ? 0 : 1;
+  const int idx = row * 2 + col;
+  if (idx >= 0 && idx < APP_COUNT) enterApp(idx);   // clears launcherOpen
 }
 
 /* ── the shared PTT service ───────────────────────────────────────────────────
@@ -1432,10 +1452,19 @@ static void doVoiceCapture() {
   // Hold works from locked, like a phone's assistant button. Wake first so the
   // capture is visible, then never touch the panel again until it is done.
   if (powerState != PWR_AWAKE) wakeScreen();
-  if (qsOpen) enterApp(appIndex);
+
+  // Hold-to-talk from anywhere lands in the capture app (Translate), so you can
+  // raise the watch on the face and just talk. If the current app already handles
+  // a capture, only close the launcher over it.
+  if (launcherOpen || !APPS[appIndex].onCapture) {
+    int t = appIndex;
+    if (!APPS[appIndex].onCapture)
+      for (int i = 0; i < APP_COUNT; i++) if (APPS[i].onCapture) { t = i; break; }
+    enterApp(t);
+  }
 
   audioBusy = true;                       // no repaints past this line
-  if (appIndex == 1) askStatus("LISTENING", C_HOT);
+  if (APPS[appIndex].onCapture) askStatus("LISTENING", C_HOT);
   es8311_voice_mute(codec, true);
   digitalWrite(PA, LOW);
 
@@ -1644,7 +1673,7 @@ static void handleCommand(char *line) {
     // Length only. Never log the password — this line lands in the console's store.
     LOGI("net", "network %u/%d: %s (%u-char pass)", netCount, NET_MAX, ssid.c_str(), pass.length());
     netConnect(12000);
-    if (powerState != PWR_OFF && !qsOpen && appIndex == 1) trPaintStatus();
+    if (powerState != PWR_OFF && !launcherOpen && APPS[appIndex].onCapture == askCapture) trPaintStatus();
   }
   else if (!strncmp(line, ">console ", 9)) {
     netConsole = line + 9; netSave("console", netConsole);
@@ -1694,7 +1723,7 @@ static void handleCommand(char *line) {
       if (rtcSet((uint16_t)y, mo, d, h, mi, s)) {
         rtcReadNow();
         LOGI("rtc", "set to %04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
-        if (powerState != PWR_OFF && !qsOpen) {
+        if (powerState != PWR_OFF && !launcherOpen) {
           if (APPS[appIndex].fullscreen) faceEnter();   // face owns the whole screen
           else                           drawStatus();
         }
@@ -1838,15 +1867,15 @@ void loop() {
     noteActivity();
     if (powerState == PWR_DIM) wakeScreen();   // first gesture only un-dims
 
-    if (qsOpen) {
-      if (g == G_SWIPE_U)      enterApp(appIndex);      // close
-      else if (g == G_TAP)     qsHandleTap(tapX, tapY);
-    } else if (g == G_SWIPE_D && swipeStartY < 90) {
-      qsOpenPanel();                                    // pulled down from the top
-    } else if (g == G_SWIPE_L) {
-      enterApp(appIndex + 1);
-    } else if (g == G_SWIPE_R) {
-      enterApp(appIndex - 1);
+    /* One consistent axis: swipe UP for the app menu, swipe DOWN for the face.
+     * Everything else is the app's own. No more swipe-through ring. */
+    if (launcherOpen) {
+      if (g == G_SWIPE_D)      enterApp(0);             // back to the face
+      else if (g == G_TAP)     launcherTap(tapX, tapY);
+    } else if (g == G_SWIPE_U) {
+      openLauncher();
+    } else if (g == G_SWIPE_D && appIndex != 0) {
+      enterApp(0);                                      // home from within an app
     } else if (APPS[appIndex].onGesture) {
       APPS[appIndex].onGesture(g);
     }
@@ -1863,7 +1892,7 @@ void loop() {
       netWas = online;
       if (online) LOGI("net", "online, ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
       else        LOGW("net", "offline");
-      if (!qsOpen && appIndex == 1) trPaintStatus();
+      if (!launcherOpen && APPS[appIndex].onCapture == askCapture) trPaintStatus();
     }
   }
 
@@ -1872,9 +1901,9 @@ void loop() {
   if (now - lastPmic > 500)     { lastPmic = now; pmicIrqPeek(); }
   if (now - lastStatus > 10000) {
     lastStatus = now;
-    if (!qsOpen && !APPS[appIndex].fullscreen) drawStatus();
+    if (!launcherOpen && !APPS[appIndex].fullscreen) drawStatus();
   }
-  if (now - lastTick > 100 && !qsOpen) {
+  if (now - lastTick > 100 && !launcherOpen) {
     lastTick = now;
     if (APPS[appIndex].onTick) APPS[appIndex].onTick(now);
   }
