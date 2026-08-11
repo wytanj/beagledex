@@ -226,6 +226,33 @@ if (!args.bin) {
   process.exit(0)
 }
 
+/* Refuse to record a version the firmware does not agree with.
+ *
+ * This has now bitten twice: --version said 0.6.1 and 0.9.0 while FW_VERSION in
+ * the sketch still said 0.6.0 and 0.8.0, so the build record and the running
+ * firmware disagreed. The console caught it both times via the shipped-vs-active
+ * diff, which is the diff working — but a flash history that CAN be wrong
+ * eventually is, and this whole project rests on it not being.
+ *
+ * The bin path is firmware/<sketch>/build/<sketch>.ino.bin, so the source sits
+ * next to it. --force-version overrides for the rare deliberate mismatch.
+ */
+{
+  const m = /^(.*[\\/])build[\\/]([^\\/]+)\.ino\.bin$/.exec(args.bin.replace(/\\/g, '/'))
+  if (m && !args['force-version']) {
+    try {
+      const src = await readFile(`${m[1]}${m[2]}.ino`, 'utf8')
+      const declared = /FW_VERSION\s*=\s*"([^"]+)"/.exec(src)?.[1]
+      if (declared && declared !== VERSION) {
+        console.error(`\nrefusing: --version ${VERSION} but the sketch declares FW_VERSION "${declared}".`)
+        console.error('The device would report one version while the record claimed another.')
+        console.error(`Fix the sketch, or pass --version ${declared}, or --force-version to override.\n`)
+        process.exit(1)
+      }
+    } catch { /* no sketch beside the bin — nothing to check against */ }
+  }
+}
+
 /* ── 3. flash ─────────────────────────────────────────────────────────────── */
 
 console.log(`\n── write ${args.bin} → ${ADDR} ────────────────────────────────`)

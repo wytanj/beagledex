@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.8.0";
+static const char *FW_VERSION = "0.9.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -116,15 +116,18 @@ static Arduino_CO5300 *gfx = new Arduino_CO5300(
 
 static bool haveDisplay = false;
 
+/* Console green and orange, on black. Two hues only — everything is either the
+ * green (normal, idle, good) or the orange (attention, active, wrong), which on an
+ * AMOLED also means most of the panel stays unlit and cheap. */
 static constexpr uint16_t C_BG     = RGB565(0, 0, 0);
-static constexpr uint16_t C_CARD   = RGB565(22, 24, 28);
-static constexpr uint16_t C_DIM    = RGB565(130, 138, 150);
-static constexpr uint16_t C_FAINT  = RGB565(70, 76, 86);
-static constexpr uint16_t C_ACCENT = RGB565(16, 148, 152);
-static constexpr uint16_t C_OK     = RGB565(64, 208, 120);
-static constexpr uint16_t C_HOT    = RGB565(232, 72, 72);
-static constexpr uint16_t C_COOL   = RGB565(96, 168, 248);
-static constexpr uint16_t C_WARN   = RGB565(240, 176, 64);
+static constexpr uint16_t C_CARD   = RGB565(8, 28, 14);      // near-black green tint
+static constexpr uint16_t C_DIM    = RGB565(88, 176, 112);   // muted green, body text
+static constexpr uint16_t C_FAINT  = RGB565(36, 88, 52);     // dark green, hints
+static constexpr uint16_t C_ACCENT = RGB565(0, 232, 100);    // the green
+static constexpr uint16_t C_OK     = RGB565(0, 232, 100);
+static constexpr uint16_t C_COOL   = RGB565(168, 255, 192);  // pale green, transient states
+static constexpr uint16_t C_WARN   = RGB565(255, 168, 32);   // the orange
+static constexpr uint16_t C_HOT    = RGB565(255, 112, 0);    // deeper orange: recording, faults
 
 /* The shell owns STATUS/TITLE/HINT; apps get BODY and nothing else. That is what
  * keeps the chrome consistent as apps come and go. */
@@ -498,7 +501,7 @@ struct FaceDesc {
 
 /* Defaults are the no-photo face, so a device with an empty slot still tells the
  * time properly instead of showing an error. */
-static FaceDesc face = { LCD_WIDTH, LCD_HEIGHT, 40, 180, 7, RGB565(255, 255, 255), true, 3000 };
+static FaceDesc face = { LCD_WIDTH, LCD_HEIGHT, 40, 180, 7, RGB565(0, 232, 100), true, 3000 };
 
 static const uint16_t             *facePix = nullptr;
 static esp_partition_mmap_handle_t faceMap = 0;
@@ -662,7 +665,7 @@ static void trPaintRows() {
     gfx->setTextColor(C_DIM);
     gfx->setCursor(PAD + 10, y + 10);
     gfx->print(i == 0 ? "you " : "them");
-    gfx->setTextColor(RGB565_WHITE);
+    gfx->setTextColor(C_ACCENT);
     gfx->setCursor(PAD + 80, y + 10);
     gfx->print(LANGS[i == 0 ? langA : langB].label);
   }
@@ -691,7 +694,7 @@ static void trPaintText() {
     cy += 84;
   }
   if (trTranslation[0]) {
-    if (renderable(trTranslation)) drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, RGB565_WHITE);
+    if (renderable(trTranslation)) drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
     else                           drawWrapped("translation received — this script needs the host to rasterise it, see TODO",
                                                PAD, cy, BODY_Y + BODY_H - 14, C_WARN);
   } else if (trNote[0]) {
@@ -856,7 +859,7 @@ static constexpr int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
 
 static void drawStatus() {
   gfx->fillRect(0, 0, LCD_WIDTH, STATUS_H, C_CARD);
-  gfx->setTextSize(2); gfx->setTextColor(RGB565_WHITE);
+  gfx->setTextSize(2); gfx->setTextColor(C_ACCENT);
   gfx->setCursor(PAD, 12);
   if (rtc.valid) gfx->printf("%02u:%02u", rtc.hour, rtc.min);
   else           gfx->print("--:--");
@@ -983,7 +986,7 @@ static void qsPaint() {
     const int16_t y = QS_Y0 + i * QS_ROW_H;
     gfx->fillRoundRect(PAD, y, BODY_W, QS_ROW_H - 8, 8, C_CARD);
     gfx->setTextSize(2);
-    gfx->setTextColor(i == 3 ? C_FAINT : RGB565_WHITE);   // audio row is read-only
+    gfx->setTextColor(i == 3 ? C_FAINT : C_ACCENT);   // audio row is read-only
     gfx->setCursor(PAD + 12, y + 14);
     gfx->print(labels[i]);
   }

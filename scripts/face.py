@@ -137,7 +137,7 @@ def esptool_write(path, addr, port):
 
 def main():
     ap = argparse.ArgumentParser(description="watch face builder")
-    ap.add_argument("action", choices=["build", "write", "test", "preview"])
+    ap.add_argument("action", choices=["build", "write", "test", "preview", "clear"])
     ap.add_argument("image", nargs="?")
     ap.add_argument("-o", "--out")
     ap.add_argument("--slot", type=int, default=0)
@@ -150,6 +150,22 @@ def main():
     ap.add_argument("--hold-ms", type=int, default=3000,
                     help="how long the photo shows on wake before the dark face")
     args = ap.parse_args()
+
+    if args.action == "clear":
+        """Zero the descriptor only. The firmware validates the magic before it
+        blits, so a zeroed header means it falls back to the plain digital face —
+        and the pixels behind it are left alone, costing one 4 KB sector instead
+        of erasing 322 KB for nothing."""
+        blank = ROOT / "firmware" / f"face{args.slot}-clear.bin"
+        blank.write_bytes(b"\x00" * PIX_OFFSET)
+        addr = STORAGE_BASE + args.slot * SLOT_STRIDE
+        print(f"clearing slot {args.slot} descriptor at {addr:#x}")
+        ok = esptool_write(blank, addr, args.port)
+        blank.unlink(missing_ok=True)
+        if not ok:
+            sys.exit("esptool write failed")
+        print("cleared. reboot, or: npm run push raw \">face 0\"")
+        return
 
     if args.action == "preview":
         blob = Path(args.image).read_bytes()
