@@ -2,7 +2,7 @@
 
 Working notes for translator·console + the ESP32-S3 watch firmware.
 Repo: https://github.com/wytanj/beagledex.git
-Last updated 2026-08-11.
+Last updated 2026-08-12.
 
 ## Where this is
 
@@ -44,6 +44,51 @@ npm run log                  # serial → .data/db (records what happened)
 npm run monitor              # serial → terminal only (records nothing)
 npm run push time            # set the RTC from this machine's clock
 ```
+
+## Chats in Ask Grok — browse what was asked (SD lands 2026-08-13)
+
+A **64 GB microSD arrives 2026-08-13**, and this is the first thing it earns its
+slot doing. Ask Grok keeps an append-only log of every exchange on the card, and a
+**Chats** view lets you scroll past questions and re-open an answer. Grounded search
+answers (now live) are exactly the ones worth keeping — "what did that say about the
+Nvidia financing" a day later shouldn't mean asking again.
+
+- [ ] **Gating step — actually mount the card.** The microSD pinout is still
+      unestablished (see Open questions), and nothing here works until `cacheReady()`
+      returns true against a mounted FAT card. Leads in order: the Waveshare schematic
+      PDF on files.waveshare.com, xiaozhi's board config, the vendor SD example's
+      `pin_config.h`. This is the one hardware unknown between here and Chats; do it
+      the day the card lands. The `cacheReady()`/`cachePut()`/`cacheGet()` seam in
+      `watch.ino` is already in place, so this is a fill-in, not a refactor.
+- [ ] **Data model — one JSONL line per exchange**, appended to
+      `/sd/askgrok/chats.jsonl`:
+      `{"t":<unix from PCF85063>,"q":"...","a":"...","rid":"<grok response id>"}`.
+      Text is tiny (~1 KB each); 100k chats is ~100 MB on a 64 GB card, so no rotation
+      is needed at first. **Do not cache audio in v1** — a 35 s answer is ~1.1 MB of
+      PCM, and re-reading a stored answer is a re-synth (cheap, ~1 s), not a re-query.
+      An optional `/sd/askgrok/<rid>.pcm` sidecar can come later if replay-with-no-
+      network is ever wanted.
+- [ ] **Where the write happens.** The host already logs every `[ask] "q" -> a`, so
+      two honest options: the device appends the line itself after a good answer (has
+      the RTC time; needs the card mounted), or the host returns the exchange in a
+      response header and the device just persists bytes. **Prefer device-writes-
+      locally** so Chats reads back with no network; have the host mirror the exchange
+      into `.data` opportunistically for the dashboard (folds into item 2, the
+      device-page config work).
+- [ ] **UI.** Ask Grok's idle screen (before you ask) gets a history affordance — a
+      small list glyph, or swipe-up for the list — newest-first, scrollable; tap a row
+      to show its answer, Play to re-read it through TTS. The three transport buttons
+      already exist; Chats reuses them. Keep the entry point **off** BOOT: BOOT stays
+      tap-lock / double-tap-app / hold-talk, untouched.
+- [ ] **This is also the memory hook (the deferred "conversation memory").** Two
+      independent mechanisms — don't conflate them:
+      - **Browse** = the SD JSONL above. What the user sees.
+      - **Context** = grok remembers the thread. The Agent Tools API
+        (`/v1/responses`, now live for Ask Grok) returns `store` and
+        `previous_response_id`, so chaining is native: persist `rid`, send
+        `previous_response_id:<last rid>` on the next ask, and grok carries context
+        server-side with no history re-upload. That is why the JSONL stores `rid` —
+        the browse log and the memory chain share one key.
 
 ## Before the first commit
 
@@ -225,7 +270,9 @@ it owns the API key and the image pipeline.
   includes the `pin_config.h` their repo doesn't ship. Leads in order: the
   schematic PDF on files.waveshare.com, xiaozhi's board config, the vendor
   example. The `cacheReady()`/`cachePut()`/`cacheGet()` seam in `watch.ino` is
-  already in place, so the card is a fill-in rather than a refactor.
+  already in place, so the card is a fill-in rather than a refactor. **This now has a
+  consumer and a date**: the 64 GB card lands 2026-08-13 and Chats in Ask Grok is
+  waiting on the mount — see "Chats in Ask Grok" above.
 - **Gesture engine** — the CST820 reports gesture `0x00` for everything when polled.
   Swipes are derived from coordinates instead, which is fine and arguably better. If
   native gestures are ever wanted, `0xEC` (MotionMask) is the lead, and it may need the
