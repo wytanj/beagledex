@@ -76,17 +76,22 @@ elif verb == "tok":
     cmd = ">tok " + rest
 elif verb == "clear":
     cmd = ">clear"
-elif verb == "wifi":
+elif verb in ("wifi", "hotspot"):
+    # Several networks can be stored; the device connects to whichever is in range.
+    # `wifi` = home from .env, `hotspot` = phone from .env, or pass "<ssid> <pass>".
     env = load_env()
     if rest:
         cmd = ">wifi " + rest
     else:
-        ssid = env.get("HOME_WIFI_SSID")
-        pw = env.get("HOME_WIFI_PASSWORD")
+        prefix = "PHONE_WIFI" if verb == "hotspot" else "HOME_WIFI"
+        ssid = env.get(f"{prefix}_SSID")
+        pw = env.get(f"{prefix}_PASSWORD")
         if not ssid or not pw:
-            raise SystemExit("set HOME_WIFI_SSID and HOME_WIFI_PASSWORD in .env, or pass them")
+            raise SystemExit(f"set {prefix}_SSID and {prefix}_PASSWORD in .env, or pass them explicitly")
         cmd = f">wifi {ssid} {pw}"
-        print(f"(ssid {ssid}, password {len(pw)} chars from .env)")
+        print(f"({verb}: ssid {ssid}, password {len(pw)} chars from .env)")
+elif verb == "wifi-clear":
+    cmd = ">wifi clear"
 elif verb == "console":
     url = rest or f"http://{lan_ip()}:3000"
     cmd = ">console " + url
@@ -114,7 +119,7 @@ s.open()
 
 # Never echo a credential. These commands are typed at a terminal whose history is
 # kept, and the reply below gets copied into logs.
-if verb == "wifi":
+if verb in ("wifi", "hotspot"):
     print("→ >wifi <ssid> <password>", flush=True)
 elif verb == "token":
     print("→ >token <token>", flush=True)

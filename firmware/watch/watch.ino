@@ -66,6 +66,7 @@
 #include <esp_mac.h>
 #include <esp_partition.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <Arduino_GFX_Library.h>
@@ -77,7 +78,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.15.0";
+static const char *FW_VERSION = "0.16.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -200,31 +201,69 @@ static size_t cacheGet(const char *key, uint8_t *out, size_t cap) {
  * deliberately NOT in config/devices/*.json, because that file is tracked in git
  * and a WiFi password has no business in version control.
  *
- *   npm run push wifi "<ssid>" "<pass>"
+ *   npm run push wifi                # home, from .env
+ *   npm run push hotspot             # phone, from .env
+ *   npm run push wifi "<ssid>" "<pass>"   # any network, explicit
  *   npm run push console http://<host>:3000
  *   npm run push token <DEVICE_TOKEN>
  *
- * NVS is unencrypted, so these are recoverable from a flash dump. Acceptable for
- * a device living on your own home network; it would not be for one carrying
- * anybody else's credentials.
+ * MULTIPLE NETWORKS. Several are stored, and WiFiMulti connects to whichever
+ * known one is in range, strongest first — home at home, phone hotspot when out,
+ * no mode switch to remember. The catch worth stating: the ESP32-S3 is 2.4 GHz
+ * only, so a phone hotspot must offer a 2.4 GHz band (iPhone: "Maximize
+ * Compatibility" on; most Androds: set the band to 2.4 GHz).
  *
- * THE RADIO IS TIED TO THE SCREEN. WiFi costs on the order of 80 mA, which would
- * comfortably undo the sleep work — this thing already only manages eight hours.
- * So the radio comes up when the screen does and goes down when it sleeps, which
- * is a decent proxy for "is anyone using it". A capture that arrives before the
- * join completes waits for it rather than failing.
+ * NVS is unencrypted, so these are recoverable from a flash dump. Acceptable for
+ * a device on your own networks; it would not be for one carrying anybody else's.
+ *
+ * THE RADIO IS TIED TO THE SCREEN — ~80 mA would undo the sleep work, so it comes
+ * up with the screen and drops when it sleeps. A capture that arrives before the
+ * join completes waits for it.
  */
 static Preferences prefs;
-static String netSsid, netPass, netConsole, netToken;
-static bool   online = false;
+static constexpr int NET_MAX = 4;
+struct WifiNet { String ssid, pass; };
+static WifiNet nets[NET_MAX];
+static int     netCount = 0;
+static int     netLast  = 0;          // index that connected last — warmed first on wake
+static String  netConsole, netToken;
+static bool    online = false;
+static WiFiMulti *multi = nullptr;
+
+static void multiRebuild() {
+  delete multi;
+  multi = new WiFiMulti();
+  for (int i = 0; i < netCount; i++) multi->addAP(nets[i].ssid.c_str(), nets[i].pass.c_str());
+}
+
+static void netPersist() {
+  prefs.begin("net", false);
+  prefs.putInt("count", netCount);
+  for (int i = 0; i < netCount; i++) {
+    prefs.putString((String("ssid") + i).c_str(), nets[i].ssid);
+    prefs.putString((String("pass") + i).c_str(), nets[i].pass);
+  }
+  prefs.end();
+}
 
 static void netLoad() {
   prefs.begin("net", true);
-  netSsid    = prefs.getString("ssid", "");
-  netPass    = prefs.getString("pass", "");
+  netCount = prefs.getInt("count", 0);
+  if (netCount > NET_MAX) netCount = NET_MAX;
+  for (int i = 0; i < netCount; i++) {
+    nets[i].ssid = prefs.getString((String("ssid") + i).c_str(), "");
+    nets[i].pass = prefs.getString((String("pass") + i).c_str(), "");
+  }
+  // Migrate the pre-multi single network so home survives this upgrade unre-pushed.
+  if (netCount == 0) {
+    const String legacy = prefs.getString("ssid", "");
+    if (legacy.length()) { nets[0] = { legacy, prefs.getString("pass", "") }; netCount = 1; }
+  }
   netConsole = prefs.getString("console", "");
   netToken   = prefs.getString("token", "");
   prefs.end();
+  if (netCount) netPersist();          // write back a migrated legacy network
+  multiRebuild();
 }
 
 static void netSave(const char *k, const String &v) {
@@ -233,27 +272,62 @@ static void netSave(const char *k, const String &v) {
   prefs.end();
 }
 
-/* Start a join and return immediately. Waking the screen must not stall on the
- * radio — a frozen UI while WiFi negotiates would be a worse bug than being
- * briefly offline. loop() notices when it lands. */
+/* Add or update a network by SSID. Updating an existing one (same SSID, new
+ * password) is the common case when a hotspot password rotates. */
+static void netAdd(const String &ssid, const String &pass) {
+  for (int i = 0; i < netCount; i++) {
+    if (nets[i].ssid == ssid) { nets[i].pass = pass; netPersist(); multiRebuild(); return; }
+  }
+  if (netCount >= NET_MAX) {           // full: replace the oldest, keeping the last-good
+    const int victim = (netLast == 0) ? 1 : 0;
+    nets[victim] = { ssid, pass };
+  } else {
+    nets[netCount++] = { ssid, pass };
+  }
+  netPersist();
+  multiRebuild();
+}
+
+/* Warm the last-good network without blocking — covers the common case (home)
+ * instantly. If it is not in range, netConnect() falls back to a full scan. */
 static void netKick() {
-  if (!netSsid.length() || WiFi.status() == WL_CONNECTED) return;
+  if (netCount == 0 || WiFi.status() == WL_CONNECTED) return;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(netSsid.c_str(), netPass.c_str());
+  WiFi.begin(nets[netLast].ssid.c_str(), nets[netLast].pass.c_str());
+}
+
+static void rememberConnected() {
+  const String s = WiFi.SSID();
+  for (int i = 0; i < netCount; i++) if (nets[i].ssid == s) { netLast = i; break; }
 }
 
 static bool netConnect(uint32_t timeoutMs) {
   if (WiFi.status() == WL_CONNECTED) { online = true; return true; }
-  if (!netSsid.length()) { LOGW("net", "no ssid stored — run: npm run push wifi"); return false; }
+  if (netCount == 0) { LOGW("net", "no networks stored — run: npm run push wifi"); return false; }
 
-  netKick();
+  WiFi.mode(WIFI_STA);
   const uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) delay(120);
+
+  // Give the warmed last-good network a short head start — no scan needed when
+  // you're where you usually are.
+  netKick();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 2500) delay(100);
+
+  // Otherwise scan and take whichever known network is actually in range. This is
+  // the away case: home is absent, the phone hotspot is present.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!multi) multiRebuild();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) multi->run(4000);
+  }
 
   online = WiFi.status() == WL_CONNECTED;
-  if (online) LOGI("net", "%s  ip %s  rssi %d  in %lu ms", netSsid.c_str(),
-                   WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)(millis() - t0));
-  else        LOGW("net", "join failed for %s — the rest of the watch is unaffected", netSsid.c_str());
+  if (online) {
+    rememberConnected();
+    LOGI("net", "%s  ip %s  rssi %d  in %lu ms", WiFi.SSID().c_str(),
+         WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)(millis() - t0));
+  } else {
+    LOGW("net", "no known network in range (%d stored)", netCount);
+  }
   return online;
 }
 
@@ -1553,17 +1627,22 @@ static void handleCommand(char *line) {
     if (offAfterMs && dimAfterMs > offAfterMs / 2) dimAfterMs = offAfterMs / 2;
     LOGI("pwr", "sleep after %ld s", s);
   }
+  else if (!strcmp(line, ">wifi clear")) {
+    netCount = 0; netLast = 0;
+    netPersist(); multiRebuild();
+    LOGI("net", "all networks cleared");
+  }
   else if (!strncmp(line, ">wifi ", 6)) {
-    /* Split on the LAST space, so an SSID containing spaces still works while the
-     * password (which must not contain one) stays intact. */
+    /* Adds or updates a network — several are kept, and WiFiMulti picks whichever
+     * is in range. Split on the LAST space so an SSID with spaces ("Jeremy's
+     * iPhone") works while the password, which must not contain one, stays intact. */
     char *arg = line + 6, *sp = strrchr(arg, ' ');
-    if (!sp) { LOGW("cmd", "usage: >wifi <ssid> <password>"); return; }
+    if (!sp) { LOGW("cmd", "usage: >wifi <ssid> <password>  |  >wifi clear"); return; }
     *sp = 0;
-    netSsid = arg; netPass = sp + 1;
-    netSave("ssid", netSsid); netSave("pass", netPass);
-    // Length only. Never log the password itself — this line ends up in the
-    // console's log store and in git-adjacent places.
-    LOGI("net", "stored ssid %s, password %u chars", netSsid.c_str(), netPass.length());
+    const String ssid = arg, pass = sp + 1;
+    netAdd(ssid, pass);
+    // Length only. Never log the password — this line lands in the console's store.
+    LOGI("net", "network %u/%d: %s (%u-char pass)", netCount, NET_MAX, ssid.c_str(), pass.length());
     netConnect(12000);
     if (powerState != PWR_OFF && !qsOpen && appIndex == 1) trPaintStatus();
   }
@@ -1593,10 +1672,11 @@ static void handleCommand(char *line) {
     else             LOGE("net", "console unreachable: %d — host firewall on port 3000?", code);
   }
   else if (!strcmp(line, ">net")) {
-    LOGI("net", "ssid=%s console=%s token=%s state=%s",
-         netSsid.length() ? netSsid.c_str() : "(none)",
+    LOGI("net", "%d network(s), console=%s token=%s state=%s", netCount,
          netConsole.length() ? netConsole.c_str() : "(none)",
          netToken.length() ? "set" : "(none)", online ? "online" : "offline");
+    for (int i = 0; i < netCount; i++)
+      LOGI("net", "  [%d] %s%s", i, nets[i].ssid.c_str(), i == netLast ? " (last used)" : "");
     if (online) LOGI("net", "ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
   }
   else if (!strncmp(line, ">face ", 6)) {
@@ -1703,8 +1783,8 @@ void setup() {
   faceLoad(0);          // before the first paint, so the face can use its photo
 
   netLoad();
-  if (netSsid.length()) { LOGI("net", "joining %s", netSsid.c_str()); netKick(); }
-  else                  LOGI("net", "no credentials — npm run push wifi \"<ssid>\" \"<pass>\"");
+  if (netCount) { LOGI("net", "%d network(s) stored — warming %s", netCount, nets[netLast].ssid.c_str()); netKick(); }
+  else          LOGI("net", "no credentials — npm run push wifi");
 
   enterApp(0);
   noteActivity();
