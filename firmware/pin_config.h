@@ -60,11 +60,25 @@
  * anywhere between the microphone and the translation backend. */
 #define AUDIO_SAMPLE_RATE       16000
 
-/* Gain 2 (12 dB), not the vendor example's 3 (18 dB). Measured on this unit at
- * gain 3: RMS -24 dBFS (good) but peaks at -0.8 dBFS, one dB off the rail.
- * Clipped plosives measurably hurt speech-to-text accuracy, so trade the
- * headroom back — gain 2 puts peaks near -7 dBFS with RMS still around -30. */
-#define AUDIO_MIC_GAIN          2
+/* ADC scale (ES8311 REG16): 0..7 = 0,6,12,18,24,30,36,42 dB. Separate from the
+ * analog PGA in REG14, which es8311_microphone_config leaves at maximum.
+ *
+ * NOW 5 (30 dB). This was 2 (12 dB), chosen from an early measurement where gain
+ * 3 peaked at -0.8 dBFS and clipped. Under those conditions that was right; under
+ * current ones 12 dB left speech below the noise floor and transcription returned
+ * empty strings every time.
+ *
+ * Swept on this unit with `npm run push raw ">mic"`, ambient room, no speech:
+ *
+ *   gain 2 (12 dB)   rms   36   peak  -142..121     unusable
+ *   gain 5 (30 dB)   rms  300   peak -1106..1789    ~-25 dBFS, headroom for speech
+ *   gain 7 (42 dB)   rms 1120   peak -4217..3581    ambient alone at -18 dBFS
+ *
+ * +18 dB of setting produced +18.4 dB of signal, so the whole chain is linear and
+ * healthy — this was a level problem, not a fault. 5 is chosen over 7 so that
+ * speech, which sits well above ambient, has somewhere to go before clipping.
+ * Re-sweep with >gain if the enclosure or microphone port ever changes. */
+#define AUDIO_MIC_GAIN          5
 #define AUDIO_VOICE_VOLUME      85
 
 /* ── Display: CO5300 AMOLED over QSPI, 368 x 448 ──────────────────────────────

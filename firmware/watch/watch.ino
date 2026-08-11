@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.9.0";
+static const char *FW_VERSION = "0.11.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -128,6 +128,7 @@ static constexpr uint16_t C_OK     = RGB565(0, 232, 100);
 static constexpr uint16_t C_COOL   = RGB565(168, 255, 192);  // pale green, transient states
 static constexpr uint16_t C_WARN   = RGB565(255, 168, 32);   // the orange
 static constexpr uint16_t C_HOT    = RGB565(255, 112, 0);    // deeper orange: recording, faults
+static constexpr uint16_t C_AOD    = RGB565(0, 132, 56);     // dim green for the always-on face
 
 /* The shell owns STATUS/TITLE/HINT; apps get BODY and nothing else. That is what
  * keeps the chrome consistent as apps come and go. */
@@ -146,14 +147,25 @@ static void clearBody() { gfx->fillRect(0, BODY_Y, LCD_WIDTH, BODY_H, C_BG); }
  * property of the device and every app inherits it. These are exactly the values
  * the web UI will configure once there is a transport to carry them.
  */
-enum PowerState : uint8_t { PWR_AWAKE, PWR_DIM, PWR_OFF };
+/* AWAKE → DIM → AOD, and OFF only on an explicit lock (or a long AOD timeout).
+ *
+ * The always-on face is the one thing this panel is uniquely good at and the
+ * previous design threw away: per-pixel emission means a handful of dim digits on
+ * black costs almost nothing, where an LCD would still be burning a backlight for
+ * the same picture. So the resting state now shows the time instead of nothing.
+ *
+ * OFF still exists, because "off" should mean off when you ask for it. */
+enum PowerState : uint8_t { PWR_AWAKE, PWR_DIM, PWR_AOD, PWR_OFF };
 
 static PowerState powerState   = PWR_AWAKE;
 static uint32_t   lastActivity = 0;
 static uint32_t   dimAfterMs   = 15000;
-static uint32_t   offAfterMs   = 45000;   // 0 disables sleeping entirely
+static uint32_t   aodAfterMs   = 45000;   // → always-on face
+static uint32_t   offAfterMs   = 0;       // 0 = rest at AOD and never go fully dark
+static bool       aodEnabled   = true;
 static uint8_t    brightFull   = 255;
 static uint8_t    brightDim    = 40;
+static uint8_t    aodBright    = 14;      // enough to read in a dim room, little else
 
 /* ── cache: the SD card that isn't fitted yet ─────────────────────────────────
  * Everything that will want the card — recorded WAV, the offline phrase cache,
@@ -814,6 +826,7 @@ static const char *powerName() {
   switch (powerState) {
     case PWR_AWAKE: return "awake";
     case PWR_DIM:   return "dim";
+    case PWR_AOD:   return "always-on";
     default:        return "off";
   }
 }
@@ -911,13 +924,45 @@ static void enterApp(int i) {
 
 static void noteActivity() { lastActivity = millis(); }
 
+/* ── the always-on face ───────────────────────────────────────────────────────
+ * Time only, dim, no chrome, redrawn once a minute.
+ *
+ * The position shifts a few pixels every minute, and that is not decoration: an
+ * AMOLED ages per pixel, so digits held in one spot at one brightness for months
+ * ghost permanently. Jitter spreads the wear over a band instead of etching it
+ * into eight fixed glyph positions. It is cheap insurance against the one failure
+ * mode this display technology has that an LCD does not.
+ */
+static constexpr int8_t AOD_JITTER[8][2] = {
+  {0, 0}, {6, 0}, {6, 6}, {0, 6}, {-6, 6}, {-6, 0}, {-6, -6}, {0, -6},
+};
+static uint8_t aodStep = 0, aodLastMin = 255;
+
+static void aodPaint(bool full) {
+  if (full) { gfx->fillScreen(C_BG); aodLastMin = 255; }
+  if (!full && rtc.min == aodLastMin) return;
+  aodLastMin = rtc.min;
+
+  static constexpr int16_t BX = 44, BY = 190, SZ = 6;
+  // Clear generously so the previous jittered position goes with it.
+  gfx->fillRect(BX - 14, BY - 14, 6 * SZ * 5 + 32, 8 * SZ + 28, C_BG);
+
+  aodStep = (uint8_t)((aodStep + 1) & 7);
+  gfx->setTextSize(SZ);
+  gfx->setTextColor(C_AOD);
+  gfx->setCursor(BX + AOD_JITTER[aodStep][0], BY + AOD_JITTER[aodStep][1]);
+  if (rtc.valid) gfx->printf("%02u:%02u", rtc.hour, rtc.min);
+  else           gfx->print("--:--");
+}
+
 static void wakeScreen() {
   if (!haveDisplay) return;
-  const bool wasOff = powerState == PWR_OFF;
+  const bool wasOff  = powerState == PWR_OFF;
+  const bool wasDark = wasOff || powerState == PWR_AOD;
   powerState = PWR_AWAKE;
   gfx->setBrightness(brightFull);
-  if (wasOff) {
-    gfx->displayOn();
+  if (wasDark) {
+    if (wasOff) gfx->displayOn();
     // Repaint everything: nothing was drawn while the panel was off, and
     // trusting a controller to have kept a framebuffer is how this board ended
     // up displaying a stale vendor frame for a day.
@@ -932,22 +977,37 @@ static void wakeScreen() {
 }
 
 static void powerTick(uint32_t now) {
-  if (!haveDisplay || offAfterMs == 0) return;
+  if (!haveDisplay) return;
   const uint32_t idle = now - lastActivity;
 
-  if (powerState == PWR_AWAKE && idle > dimAfterMs) {
+  if (powerState == PWR_AWAKE && dimAfterMs && idle > dimAfterMs) {
     powerState = PWR_DIM;
     gfx->setBrightness(brightDim);
     LOGI("pwr", "dim after %lu ms idle", (unsigned long)idle);
-  } else if (powerState != PWR_OFF && idle > offAfterMs) {
+
+  } else if ((powerState == PWR_AWAKE || powerState == PWR_DIM) && aodAfterMs && idle > aodAfterMs) {
+    // Radio goes either way: nobody is using it at rest, and 80 mA dwarfs the
+    // handful of milliamps the dim digits cost.
+    netSleep();
+    if (aodEnabled) {
+      powerState = PWR_AOD;
+      gfx->setBrightness(aodBright);
+      aodPaint(true);
+      LOGI("pwr", "always-on face after %lu ms idle", (unsigned long)idle);
+    } else {
+      powerState = PWR_OFF;
+      gfx->setBrightness(0);
+      // Brightness alone is not enough: the controller keeps self-refreshing and
+      // the panel keeps drawing. displayOff() is the part that saves the battery.
+      gfx->displayOff();
+      LOGI("pwr", "screen off after %lu ms idle", (unsigned long)idle);
+    }
+
+  } else if (powerState == PWR_AOD && offAfterMs && idle > offAfterMs) {
     powerState = PWR_OFF;
     gfx->setBrightness(0);
-    // Brightness alone is not enough: the panel controller keeps self-refreshing
-    // and the AMOLED keeps drawing current. displayOff() is the part that saves
-    // the battery.
     gfx->displayOff();
-    netSleep();         // ~80 mA of radio is not worth leaving on for nobody
-    LOGI("pwr", "screen off after %lu ms idle", (unsigned long)idle);
+    LOGI("pwr", "fully off after %lu ms idle", (unsigned long)idle);
   }
 }
 
@@ -976,10 +1036,10 @@ static void qsPaint() {
   const char *labels[4];
   char b0[40], b1[40], b2[40], b3[40];
   snprintf(b0, sizeof b0, "brightness   %3u", brightFull);
-  if (offAfterMs) snprintf(b1, sizeof b1, "sleep after  %lu s", (unsigned long)(offAfterMs / 1000));
-  else            snprintf(b1, sizeof b1, "sleep after  never");
-  snprintf(b2, sizeof b2, "lock now");
-  snprintf(b3, sizeof b3, "audio        %s", haveAudio ? "up" : "down");
+  if (aodAfterMs) snprintf(b1, sizeof b1, "rest after   %lu s", (unsigned long)(aodAfterMs / 1000));
+  else            snprintf(b1, sizeof b1, "rest after   never");
+  snprintf(b2, sizeof b2, "always-on    %s", aodEnabled ? "on" : "off");
+  snprintf(b3, sizeof b3, "lock now");
   labels[0] = b0; labels[1] = b1; labels[2] = b2; labels[3] = b3;
 
   for (int i = 0; i < 4; i++) {
@@ -1017,18 +1077,22 @@ static void qsHandleTap(uint16_t x, uint16_t y) {
       LOGI("pwr", "brightness %u", brightFull);
       break;
     }
-    case 1: {                                   // sleep timeout, cycling
-      if      (offAfterMs == 30000)  offAfterMs = 60000;
-      else if (offAfterMs == 60000)  offAfterMs = 300000;
-      else if (offAfterMs == 300000) offAfterMs = 0;
-      else                           offAfterMs = 30000;
-      if (offAfterMs && dimAfterMs > offAfterMs / 2) dimAfterMs = offAfterMs / 2;
-      LOGI("pwr", "sleep after %lu ms, dim after %lu ms",
-           (unsigned long)offAfterMs, (unsigned long)dimAfterMs);
+    case 1: {                                   // how long before it rests
+      if      (aodAfterMs == 30000)  aodAfterMs = 60000;
+      else if (aodAfterMs == 60000)  aodAfterMs = 300000;
+      else if (aodAfterMs == 300000) aodAfterMs = 0;
+      else                           aodAfterMs = 30000;
+      if (aodAfterMs && dimAfterMs > aodAfterMs / 2) dimAfterMs = aodAfterMs / 2;
+      LOGI("pwr", "rest after %lu ms, dim after %lu ms",
+           (unsigned long)aodAfterMs, (unsigned long)dimAfterMs);
       break;
     }
-    case 2: lockNow(); return;                  // no repaint: the screen is off
-    default: return;                            // audio row is status only
+    case 2:                                     // always-on face on/off
+      aodEnabled = !aodEnabled;
+      LOGI("pwr", "always-on %s", aodEnabled ? "on" : "off");
+      break;
+    case 3: lockNow(); return;                  // no repaint: the screen is off
+    default: return;
   }
   qsPaint();
 }
@@ -1165,6 +1229,80 @@ static void handleCommand(char *line) {
     brightFull = (uint8_t)v;
     if (powerState == PWR_AWAKE) gfx->setBrightness(brightFull);
     LOGI("pwr", "brightness %u", brightFull);
+  }
+  else if (!strncmp(line, ">gain ", 6)) {
+    /* ADC_REG16, the ADC scale: 0..7 = 0,6,12,18,24,30,36,42 dB. It is separate
+     * from REG14's analog PGA, so raising it does not undo the "max PGA" the mic
+     * config sets. Runtime-adjustable because finding the right value is a sweep,
+     * and an 18-second reflash per step is a poor way to run one. */
+    if (!haveAudio) { LOGW("mic", "audio not up"); return; }
+    const int g = atoi(line + 6);
+    if (g < 0 || g > 7) { LOGW("mic", "gain must be 0..7 (0,6,12,18,24,30,36,42 dB)"); return; }
+    es8311_microphone_gain_set(codec, (es8311_mic_gain_t)g);
+    LOGI("mic", "ADC scale %d (+%d dB); build default is %d (+%d dB)",
+         g, g * 6, AUDIO_MIC_GAIN, AUDIO_MIC_GAIN * 6);
+  }
+  else if (!strcmp(line, ">mic")) {
+    /* Describe the raw ADC output numerically, which distinguishes the three
+     * candidate faults that all look like "no audio":
+     *   every sample identical      → the input is dead or unbiased
+     *   small random values         → ADC alive, nothing acoustic reaching it
+     *   L differs from R sometimes  → two independent channels, so the codec is
+     *                                 not merely duplicating one slot
+     * A DC offset also shows up as a non-zero mean, which points at bias rather
+     * than at the microphone element. */
+    if (!haveAudio) { LOGW("mic", "audio not up"); return; }
+    int16_t scratch[CHUNK];
+    int guard = 0;
+    while (i2s.available() > 0 && guard++ < 64) i2s.readBytes((char *)scratch, sizeof scratch);
+
+    const size_t want = SAMPLE_RATE * CHANNELS / 2;      // half a second
+    size_t n = 0;
+    while (n < want) {
+      const size_t room = want - n;
+      const size_t req  = (room < CHUNK ? room : CHUNK) * sizeof(int16_t);
+      const size_t got  = i2s.readBytes((char *)(buffer + n), req);
+      if (!got) break;
+      n += got / sizeof(int16_t);
+    }
+
+    const size_t frames = n / CHANNELS;
+    int32_t mn = 32767, mx = -32768;
+    int64_t sum = 0;
+    uint64_t sq = 0;
+    size_t diff = 0;
+    for (size_t i = 0; i < frames; i++) {
+      const int16_t l = buffer[i * CHANNELS], r = buffer[i * CHANNELS + 1];
+      if (l != r) diff++;
+      if (l < mn) mn = l;
+      if (l > mx) mx = l;
+      sum += l;
+      sq += (uint64_t)((int32_t)l * l);
+    }
+    LOGI("mic", "%u frames  min %ld  max %ld  mean %ld  rms %lu",
+         (unsigned)frames, (long)mn, (long)mx,
+         (long)(frames ? sum / (int64_t)frames : 0),
+         (unsigned long)(frames ? (uint32_t)sqrt((double)sq / frames) : 0));
+    LOGI("mic", "L!=R in %u/%u frames — %s", (unsigned)diff, (unsigned)frames,
+         diff ? "independent channels" : "right slot mirrors left");
+    char s[96];
+    int p = 0;
+    for (size_t i = 0; i < 10 && i < frames; i++)
+      p += snprintf(s + p, sizeof(s) - p, "%d ", buffer[i * CHANNELS]);
+    LOGI("mic", "first L samples: %s", s);
+  }
+  else if (!strncmp(line, ">aod", 4)) {
+    // ">aod" rests immediately, ">aod off"/"on" toggles the feature. Saves waiting
+    // 45 seconds every time you want to look at it.
+    if      (!strcmp(line, ">aod off")) { aodEnabled = false; LOGI("pwr", "always-on off"); }
+    else if (!strcmp(line, ">aod on"))  { aodEnabled = true;  LOGI("pwr", "always-on on"); }
+    else {
+      netSleep();
+      powerState = PWR_AOD;
+      gfx->setBrightness(aodBright);
+      aodPaint(true);
+      LOGI("pwr", "always-on face now");
+    }
   }
   else if (!strncmp(line, ">sleep ", 7)) {
     const long s = atol(line + 7);            // seconds; 0 = never
@@ -1357,6 +1495,16 @@ void loop() {
   if (powerState == PWR_OFF) {
     if (touchPresent()) wakeScreen();
     delay(120);
+    return;
+  }
+
+  /* Resting on the always-on face: keep the clock honest and watch for a finger,
+   * but run no apps and repaint nothing else. One draw a minute. */
+  if (powerState == PWR_AOD) {
+    if (touchPresent()) { wakeScreen(); return; }
+    static uint32_t lastAod = 0;
+    if (now - lastAod > 1000) { lastAod = now; rtcReadNow(); aodPaint(false); }
+    delay(80);
     return;
   }
 
