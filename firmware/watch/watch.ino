@@ -66,7 +66,6 @@
 #include <esp_mac.h>
 #include <esp_partition.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <Arduino_GFX_Library.h>
@@ -78,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.22.1";
+static const char *FW_VERSION = "0.23.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -226,15 +225,26 @@ static constexpr int NET_MAX = 4;
 struct WifiNet { String ssid, pass; };
 static WifiNet nets[NET_MAX];
 static int     netCount = 0;
-static int     netLast  = 0;          // index that connected last — warmed first on wake
+static int     netLast  = 0;          // index that connected last — tried first
 static String  netConsole, netToken;
 static bool    online = false;
-static WiFiMulti *multi = nullptr;
 
-static void multiRebuild() {
-  delete multi;
-  multi = new WiFiMulti();
-  for (int i = 0; i < netCount; i++) multi->addAP(nets[i].ssid.c_str(), nets[i].pass.c_str());
+/* Non-blocking round-robin over the stored networks. WiFiMulti scanned and picked
+ * the strongest known AP, but its scan blocks (freezing the UI) and it only ran
+ * inside netConnect() — during a capture — so the device never proactively looked
+ * for the phone hotspot when home was out of range: it just kept retrying home.
+ * Instead, netMaintain() cycles WiFi.begin() over each stored network in turn,
+ * non-blocking, every second the screen is awake — so it joins whichever known
+ * network is actually there, home or hotspot, without a capture and without a
+ * blocking scan. */
+static constexpr uint32_t NET_TRY_MS = 6000;   // seconds per network before moving on
+static int      netTryIdx = 0;
+static uint32_t netTryAt  = 0;
+
+static void netBeginTry(int idx) {
+  netTryIdx = idx;
+  netTryAt  = millis();
+  WiFi.begin(nets[idx].ssid.c_str(), nets[idx].pass.c_str());
 }
 
 static void netPersist() {
@@ -265,7 +275,6 @@ static void netLoad() {
   provider   = prefs.getInt("provider", 0);   // Translate's engine toggle
   prefs.end();
   if (netCount) netPersist();          // write back a migrated legacy network
-  multiRebuild();
 }
 
 static void saveProvider() {           // called from the Translate app
@@ -284,7 +293,7 @@ static void netSave(const char *k, const String &v) {
  * password) is the common case when a hotspot password rotates. */
 static void netAdd(const String &ssid, const String &pass) {
   for (int i = 0; i < netCount; i++) {
-    if (nets[i].ssid == ssid) { nets[i].pass = pass; netPersist(); multiRebuild(); return; }
+    if (nets[i].ssid == ssid) { nets[i].pass = pass; netPersist(); netTryAt = 0; return; }
   }
   if (netCount >= NET_MAX) {           // full: replace the oldest, keeping the last-good
     const int victim = (netLast == 0) ? 1 : 0;
@@ -293,15 +302,7 @@ static void netAdd(const String &ssid, const String &pass) {
     nets[netCount++] = { ssid, pass };
   }
   netPersist();
-  multiRebuild();
-}
-
-/* Warm the last-good network without blocking — covers the common case (home)
- * instantly. If it is not in range, netConnect() falls back to a full scan. */
-static void netKick() {
-  if (netCount == 0 || WiFi.status() == WL_CONNECTED) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(nets[netLast].ssid.c_str(), nets[netLast].pass.c_str());
+  netTryAt = 0;                        // restart the round-robin so the new one is tried
 }
 
 static void rememberConnected() {
@@ -309,33 +310,50 @@ static void rememberConnected() {
   for (int i = 0; i < netCount; i++) if (nets[i].ssid == s) { netLast = i; break; }
 }
 
+/* Start the round-robin (called on wake). Non-blocking: begins the last-good
+ * network; netMaintain() moves on if it doesn't answer. */
+static void netKick() {
+  if (netCount == 0 || WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  netBeginTry(netLast);
+}
+
+/* Advance the round-robin. Call ~1/s while awake — non-blocking, no scan. Joins
+ * whichever stored network is in range, so the hotspot is found out and about
+ * without needing a capture. */
+static void netMaintain() {
+  if (netCount == 0) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!online) {
+      online = true;
+      rememberConnected();
+      LOGI("net", "online: %s  ip %s  rssi %d", WiFi.SSID().c_str(),
+           WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    }
+    return;
+  }
+  if (online) { online = false; LOGW("net", "offline"); }
+  if (WiFi.getMode() == WIFI_OFF) { netKick(); return; }         // radio just came up
+  if (netTryAt == 0) { netBeginTry(netLast); return; }           // (re)start the cycle
+  if (millis() - netTryAt > NET_TRY_MS) {                        // this one isn't answering
+    const int next = (netTryIdx + 1) % netCount;
+    LOGI("net", "trying %s", nets[next].ssid.c_str());
+    netBeginTry(next);
+  }
+}
+
+/* Blocking connect for the capture path — the capture already waits, so spinning
+ * here is fine. Reuses the same round-robin; usually the maintain loop has already
+ * connected by the time you hold BOOT. */
 static bool netConnect(uint32_t timeoutMs) {
   if (WiFi.status() == WL_CONNECTED) { online = true; return true; }
   if (netCount == 0) { LOGW("net", "no networks stored — run: npm run push wifi"); return false; }
-
   WiFi.mode(WIFI_STA);
+  if (WiFi.getMode() == WIFI_OFF || netTryAt == 0) netKick();
   const uint32_t t0 = millis();
-
-  // Give the warmed last-good network a short head start — no scan needed when
-  // you're where you usually are.
-  netKick();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 2500) delay(100);
-
-  // Otherwise scan and take whichever known network is actually in range. This is
-  // the away case: home is absent, the phone hotspot is present.
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!multi) multiRebuild();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) multi->run(4000);
-  }
-
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) { netMaintain(); delay(150); }
   online = WiFi.status() == WL_CONNECTED;
-  if (online) {
-    rememberConnected();
-    LOGI("net", "%s  ip %s  rssi %d  in %lu ms", WiFi.SSID().c_str(),
-         WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)(millis() - t0));
-  } else {
-    LOGW("net", "no known network in range (%d stored)", netCount);
-  }
+  if (!online) LOGW("net", "no known network in range (%d stored)", netCount);
   return online;
 }
 
@@ -344,6 +362,7 @@ static void netSleep() {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   online = false;
+  netTryAt = 0;                        // next wake restarts the round-robin
   LOGI("net", "radio off with the screen");
 }
 
@@ -1827,8 +1846,8 @@ static void handleCommand(char *line) {
     LOGI("pwr", "sleep after %ld s", s);
   }
   else if (!strcmp(line, ">wifi clear")) {
-    netCount = 0; netLast = 0;
-    netPersist(); multiRebuild();
+    netCount = 0; netLast = 0; netTryAt = 0;
+    netPersist();
     LOGI("net", "all networks cleared");
   }
   else if (!strncmp(line, ">wifi ", 6)) {
@@ -2058,17 +2077,15 @@ void loop() {
     }
   }
 
-  /* Notice the radio arriving or leaving. netKick() starts joins without waiting,
-   * so this is where `online` actually becomes true. */
+  /* Drive the round-robin every second the screen is awake — this is what actually
+   * joins the hotspot when home is out of range, no capture needed. */
   static uint32_t lastNet = 0;
   static bool     netWas = false;
   if (now - lastNet > 1000) {
     lastNet = now;
-    online = WiFi.status() == WL_CONNECTED;
+    netMaintain();
     if (online != netWas) {
       netWas = online;
-      if (online) LOGI("net", "online, ip %s rssi %d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
-      else        LOGW("net", "offline");
       if (!launcherOpen && pickerFor < 0 && trScreen == TR_TALK
           && APPS[appIndex].onCapture == askCapture) talkHeaderPaint();
     }
