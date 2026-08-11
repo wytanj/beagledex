@@ -15,6 +15,7 @@
     "watch:build": "node scripts/build.mjs firmware/watch"
   },
   "dependencies": {
+    "mpg123-decoder": "^1.0.3",
     "nuxt": "^4.0.0",
     "vue": "^3.5.0",
     "vue-router": "^4.4.0"

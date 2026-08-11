@@ -126,11 +126,41 @@ export default defineEventHandler(async (event) => {
   const spoke = (stt.language || fromCode).toLowerCase()
   const targetCode = autoDirect && spoke === toCode.toLowerCase() ? fromCode : toCode
 
-  const reply = (translation: string, msChat: number) => {
+  // Text always rides in headers, so a speak-back response carries the words
+  // without the device having to parse a body it is about to play.
+  const speak = (q.speak ?? '0') === '1'
+  const setTextHeaders = (translation: string) => {
     setHeader(event, 'X-Transcript', encodeURIComponent(transcript))
     setHeader(event, 'X-Translation', encodeURIComponent(translation))
     setHeader(event, 'X-Detected', spoke)
     setHeader(event, 'X-Target', targetCode)
+  }
+
+  const reply = async (translation: string, msChat: number) => {
+    setTextHeaders(translation)
+
+    /* The speak path returns to this route's ORIGINAL contract: body is PCM bound
+     * straight for I2S, text in the X- headers. It was written for exactly this
+     * and sat unused behind the 501. TTS failure is non-fatal — the words already
+     * exist, so fall back to JSON and let the device show what it can. */
+    if (speak && translation) {
+      const t2 = Date.now()
+      try {
+        const { pcm, seconds: spokenS } = await synthesize(translation, targetCode, key)
+        setHeader(event, 'Content-Type', 'application/octet-stream')
+        setHeader(event, 'X-Audio-Format', 'pcm-s16le-16000-2ch')
+        setHeader(event, 'X-Audio-Seconds', String(spokenS))
+        console.info(`[translate] ${pair} "${transcript}" -> spoke ${spokenS}s `
+          + `(stt ${msStt}ms, chat ${msChat}ms, tts ${Date.now() - t2}ms)`)
+        return pcm
+      } catch (e: any) {
+        setHeader(event, 'X-Audio-Format', 'none')
+        setHeader(event, 'X-Audio-Error', encodeURIComponent(String(e?.message ?? e).slice(0, 120)))
+        console.error(`[translate] tts failed: ${e?.message ?? e}`)
+        // fall through to the JSON body below
+      }
+    }
+
     return {
       transcript, translation,
       detected: spoke,
@@ -143,7 +173,7 @@ export default defineEventHandler(async (event) => {
   // Nothing said. Don't spend a chat call proving it.
   if (!transcript) {
     console.info(`[translate] ${pair} ${seconds}s → silence (stt ${msStt}ms)`)
-    return reply('', 0)
+    return await reply('', 0)
   }
 
   /* ── 2. translate ─────────────────────────────────────────────────────────── */
@@ -183,5 +213,5 @@ export default defineEventHandler(async (event) => {
   console.info(`[translate] ${pair} ${seconds}s "${transcript}" → "${translation}" `
     + `(stt ${msStt}ms, chat ${msChat}ms)`)
 
-  return reply(translation, msChat)
+  return await reply(translation, msChat)
 })

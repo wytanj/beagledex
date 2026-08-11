@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.12.0";
+static const char *FW_VERSION = "0.13.0";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -790,6 +790,51 @@ static bool jsonField(const String &src, const char *name, char *out, size_t cap
   return true;
 }
 
+/* Percent-decode a header value in place-ish into out. The console sends text
+ * URL-encoded because HTTP headers are Latin-1 and the transcript can be UTF-8.
+ * Only the transcript is shown (it is the near-side language, so it renders); the
+ * translation is spoken, not drawn, which is the whole point of this path. */
+static void urlDecode(const String &in, char *out, size_t cap) {
+  size_t o = 0;
+  for (int i = 0; i < (int)in.length() && o < cap - 1; i++) {
+    const char c = in[i];
+    if (c == '%' && i + 2 < (int)in.length()) {
+      auto hex = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return 0;
+      };
+      out[o++] = (char)((hex(in[i + 1]) << 4) | hex(in[i + 2]));
+      i += 2;
+    } else if (c == '+') {
+      out[o++] = ' ';
+    } else {
+      out[o++] = c;
+    }
+  }
+  out[o] = 0;
+}
+
+/* Play 2-slot 16-bit PCM straight to I2S. This is the first output path in the
+ * shell — until now the amp was gated 24/7 because nothing spoke. So it unmutes
+ * and raises PA around the write and puts both back afterwards, leaving the codec
+ * exactly as it found it: idle, muted, amp off, drawing nothing. Same half-duplex
+ * discipline as capture, in the other direction. */
+static void playPcm(const int16_t *pcm, size_t samples) {
+  audioBusy = true;                       // no repaints while I2S streams from PSRAM
+  es8311_voice_mute(codec, false);
+  digitalWrite(PA, HIGH);
+  delay(8);                               // let the amp settle before the first sample
+  for (size_t i = 0; i < samples; i += CHUNK) {
+    const size_t n = (samples - i < CHUNK) ? samples - i : CHUNK;
+    i2s.write((uint8_t *)(pcm + i), n * sizeof(int16_t));
+  }
+  es8311_voice_mute(codec, true);         // back to the idle-muted state
+  digitalWrite(PA, LOW);
+  audioBusy = false;
+}
+
 static void askCapture(float secs) {
   trTranscript[0] = trTranslation[0] = 0;
 
@@ -825,34 +870,32 @@ static void askCapture(float secs) {
 
   const uint32_t t0 = millis();
   String url = netConsole + "/api/translate?pair=" + LANGS[langA].code + "-"
-             + LANGS[langB].code + "&channels=2";
+             + LANGS[langB].code + "&channels=2&speak=1";
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/octet-stream");
   if (netToken.length()) http.addHeader("Authorization", String("Bearer ") + netToken);
 
-  /* The default 5 s covers neither leg of this. A 6 s capture is ~390 KB to push
-   * over WiFi, and the console then spends 1.5-2 s in speech-to-text and
-   * translation. Timing out mid-reply looked exactly like an empty transcript,
-   * which the app then reported as SILENT — a working pipeline described as a
-   * dead microphone. */
+  /* The reply text rides in headers, so we never parse a body we are about to
+   * play. Ask HTTPClient to keep the ones we need. */
+  static const char *keep[] = { "X-Transcript", "X-Translation", "X-Target",
+                                "X-Audio-Format", "X-Audio-Error" };
+  http.collectHeaders(keep, 5);
+
+  /* The default 5 s covers none of this: a capture is a few hundred KB up, then
+   * the console spends ~1.5 s on STT and translate and another ~1 s synthesising
+   * speech, then streams the audio back down. Timing out mid-reply used to look
+   * exactly like silence. */
   http.setTimeout(30000);
 
   const size_t sent = recorded * sizeof(int16_t);
   const int code = http.POST((uint8_t *)buffer, sent);
-  const String body = code > 0 ? http.getString() : String();
-  http.end();
 
-  // Keep the outcome so `>last` can report it after the fact — the alternative is
-  // trying to have a serial capture running at the exact moment a button is held.
   lastHttpCode = code;
   lastSentBytes = sent;
-  lastBodyLen = body.length();
-  snprintf(lastBodyHead, sizeof lastBodyHead, "%s", body.substring(0, 110).c_str());
-  LOGI("translate", "http %d, sent %u B, reply %u B in %lu ms",
-       code, (unsigned)sent, (unsigned)body.length(), (unsigned long)(millis() - t0));
 
   if (code != 200) {
+    http.end();
     askStatus("ERROR", C_HOT);
     snprintf(trNote, sizeof trNote, "console said %d", code);
     trPaintText();
@@ -860,29 +903,67 @@ static void askCapture(float secs) {
     return;
   }
 
-  jsonField(body, "transcript", trTranscript, sizeof trTranscript);
-  jsonField(body, "translation", trTranslation, sizeof trTranslation);
-  char target[8] = {0};
-  jsonField(body, "target", target, sizeof target);
+  urlDecode(http.header("X-Transcript"), trTranscript, sizeof trTranscript);
+  urlDecode(http.header("X-Translation"), trTranslation, sizeof trTranslation);
+  const String fmt = http.header("X-Audio-Format");
 
-  /* Clipping is worth surfacing rather than leaving as a mystery: it degrades
-   * recognition quietly, and "just speak" came back as "just pick" because of it. */
   const bool clipped = lastPeak >= 32700;
   if (clipped) LOGW("mic", "capture clipped at peak %ld — lower the gain", (long)lastPeak);
 
+  if (fmt.startsWith("pcm")) {
+    /* Reuse the capture buffer for the reply — the upload is finished, so its
+     * contents are spent. Read the PCM stream straight into PSRAM, capped at the
+     * buffer, then play it. */
+    const size_t cap = MAX_SAMPLES * sizeof(int16_t);
+    uint8_t *dst = (uint8_t *)buffer;
+    size_t got = 0;
+    WiFiClient *stream = http.getStreamPtr();
+    const int total = http.getSize();
+    askStatus("SPEAKING", C_ACCENT);
+    snprintf(trNote, sizeof trNote, "%s", trTranscript[0] ? trTranscript : "playing reply");
+    trPaintText();
+
+    while (http.connected() && got < cap && (total < 0 || got < (size_t)total)) {
+      const size_t avail = stream->available();
+      if (avail) {
+        const size_t want = (cap - got < avail) ? cap - got : avail;
+        const int r = stream->readBytes(dst + got, want);
+        if (r <= 0) break;
+        got += r;
+      } else {
+        delay(2);
+      }
+    }
+    http.end();
+    lastBodyLen = got;
+    LOGI("translate", "http 200, sent %u B, spoke %u B in %lu ms",
+         (unsigned)sent, (unsigned)got, (unsigned long)(millis() - t0));
+
+    playPcm(buffer, got / sizeof(int16_t));
+
+    askStatus(clipped ? "CLIPPED" : "READY", clipped ? C_WARN : C_OK);
+    snprintf(trNote, sizeof trNote, "%s", trTranscript[0] ? trTranscript : "spoke reply");
+    trPaintText();
+    return;
+  }
+
+  /* No audio: either silence (nothing to say) or TTS failed. The words, if any,
+   * are still in the headers. */
+  http.end();
+  lastBodyLen = 0;
   if (!trTranscript[0]) {
-    // Reaching here means a 200 with a body we could not parse, which is a bug
-    // here rather than a microphone problem. Say which.
-    askStatus(lastBodyLen ? "NO PARSE" : "SILENT", C_WARN);
-    if (lastBodyLen) snprintf(trNote, sizeof trNote, "reply %u B but no transcript field", (unsigned)lastBodyLen);
-    else             snprintf(trNote, sizeof trNote, "nothing heard — try >mic");
+    askStatus("SILENT", C_WARN);
+    snprintf(trNote, sizeof trNote, "nothing heard — try >mic");
+  } else if (fmt == "none") {
+    askStatus("NO VOICE", C_WARN);
+    char err[80]; urlDecode(http.header("X-Audio-Error"), err, sizeof err);
+    snprintf(trNote, sizeof trNote, "heard you, TTS failed: %s", err[0] ? err : "?");
   } else {
     askStatus("READY", C_OK);
-    if (clipped) snprintf(trNote, sizeof trNote, "clipped — speak further away");
-    else         trNote[0] = 0;
+    trNote[0] = 0;
   }
   trPaintText();
-  LOGI("translate", "%.1f s -> %s (%lu ms) \"%s\"", secs, target,
+  LOGI("translate", "%.1f s (%lu ms) heard \"%s\"", secs,
        (unsigned long)(millis() - t0), trTranscript);
 }
 
