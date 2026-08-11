@@ -3,6 +3,10 @@
  * is created by the thing that produced the binary rather than typed by hand.
  */
 export default defineEventHandler(async (event) => {
+  // Guarded: this writes to the build history, and a history anyone on the LAN can
+  // forge entries in is worth less than no history at all.
+  requireDevice(event)
+
   const body = await readBody<{
     version?: string
     gitSha?: string

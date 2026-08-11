@@ -7,6 +7,10 @@
  * you can't debug from.
  */
 export default defineEventHandler(async (event) => {
+  // Guarded for the same reason as builds: the flash timeline is the one thing
+  // this console is supposed to be trustworthy about.
+  requireDevice(event)
+
   const body = await readBody<{
     deviceId?: string
     buildId?: string

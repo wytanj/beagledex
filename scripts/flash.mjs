@@ -72,6 +72,24 @@ Examples
   process.exit(args.port ? 0 : 1)
 }
 
+/* Load .env ourselves rather than relying on the shell having sourced it. The
+ * build and flash routes are token-guarded, and a flash whose record silently
+ * 401s is precisely the drift this console exists to prevent — the history would
+ * quietly stop matching what actually happened, which is worse than no history.
+ * Anything already in the environment wins, so `DEVICE_TOKEN=x npm run flash`
+ * still overrides. */
+try {
+  const text = await readFile(new URL('../.env', import.meta.url), 'utf8')
+  for (const line of text.split('\n')) {
+    const t = line.trim()
+    if (!t || t.startsWith('#')) continue
+    const eq = t.indexOf('=')
+    if (eq < 1) continue
+    const k = t.slice(0, eq).trim()
+    if (!process.env[k]) process.env[k] = t.slice(eq + 1).trim()
+  }
+} catch { /* no .env is fine — the routes warn loudly when unauthenticated */ }
+
 const PORT      = args.port
 const ADDR      = args.addr ?? '0x110000'
 const VERSION   = args.version ?? '0.0.0'
