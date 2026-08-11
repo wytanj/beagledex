@@ -77,7 +77,7 @@ extern "C" {
 #include "es8311.h"
 }
 
-static const char *FW_VERSION = "0.13.0";
+static const char *FW_VERSION = "0.13.1";
 
 /* ── audio config ─────────────────────────────────────────────────────────── */
 
@@ -652,6 +652,11 @@ static const Lang LANGS[] = {
 static constexpr int LANG_COUNT = sizeof(LANGS) / sizeof(LANGS[0]);
 static int langA = 0, langB = 1;                  // A = you, B = the other speaker
 
+static const char *langLabel(const char *code) {
+  for (int i = 0; i < LANG_COUNT; i++) if (!strcmp(LANGS[i].code, code)) return LANGS[i].label;
+  return code;
+}
+
 static char     trStatusText[20] = "READY";
 static uint16_t trStatusColour   = C_OK;
 static char     trTranscript[200] = {0};
@@ -707,22 +712,20 @@ static void trPaintText() {
   const int16_t y = BODY_Y + 2 * TR_ROW_H + 44;
   gfx->fillRect(PAD, y, BODY_W, BODY_Y + BODY_H - y, C_BG);
   int16_t cy = y;
-  if (trTranscript[0]) {
+
+  /* This device speaks its replies, so the screen is confirmation, not output. It
+   * shows only what the ASCII font can actually draw — the near-side transcript
+   * when that side is Latin — and never tries to render the foreign reply, because
+   * you just heard it. A "this script needs rendering" warning over a translation
+   * the speaker already heard aloud is noise pretending to be an error. */
+  if (trTranscript[0] && renderable(trTranscript)) {
     drawWrapped(trTranscript, PAD, cy, y + 80, C_DIM);
     cy += 84;
   }
-  if (trTranslation[0]) {
-    if (renderable(trTranslation)) {
-      drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
-    } else {
-      /* The translation arrived and is correct — it just uses a script the built-in
-       * ASCII font has no glyphs for. Say that it worked and how many bytes came
-       * back, because "needs rasterising" alone reads like a failure. */
-      char note[80];
-      snprintf(note, sizeof note, "OK: %u bytes of %s. This script needs host rendering.",
-               (unsigned)strlen(trTranslation), LANGS[langB].label);
-      drawWrapped(note, PAD, cy, BODY_Y + BODY_H - 14, C_WARN);
-    }
+  // A Latin-script reply (Spanish, French, …) is worth showing too; a non-Latin
+  // one was spoken and is deliberately not drawn.
+  if (trTranslation[0] && renderable(trTranslation)) {
+    drawWrapped(trTranslation, PAD, cy, BODY_Y + BODY_H - 14, C_ACCENT);
   } else if (trNote[0]) {
     drawWrapped(trNote, PAD, cy, BODY_Y + BODY_H - 14, C_FAINT);
   }
@@ -906,6 +909,8 @@ static void askCapture(float secs) {
   urlDecode(http.header("X-Transcript"), trTranscript, sizeof trTranscript);
   urlDecode(http.header("X-Translation"), trTranslation, sizeof trTranslation);
   const String fmt = http.header("X-Audio-Format");
+  char target[8] = {0};
+  urlDecode(http.header("X-Target"), target, sizeof target);   // read before http.end()
 
   const bool clipped = lastPeak >= 32700;
   if (clipped) LOGW("mic", "capture clipped at peak %ld — lower the gain", (long)lastPeak);
@@ -942,7 +947,8 @@ static void askCapture(float secs) {
     playPcm(buffer, got / sizeof(int16_t));
 
     askStatus(clipped ? "CLIPPED" : "READY", clipped ? C_WARN : C_OK);
-    snprintf(trNote, sizeof trNote, "%s", trTranscript[0] ? trTranscript : "spoke reply");
+    snprintf(trNote, sizeof trNote, "spoke %s%s",
+             langLabel(target), clipped ? " (mic clipped)" : "");
     trPaintText();
     return;
   }
