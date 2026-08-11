@@ -1,0 +1,31 @@
+# Partition table — ESP32-S3-Touch-AMOLED-1.8, 16 MB, translator project
+#
+# Replaces Waveshare's Xiaozhi layout (factory + one OTA slot + two SPIFFS
+# partitions of vendor assets) with a clean A/B layout plus one big storage
+# partition.
+#
+# TWO RULES THIS TABLE OBEYS:
+#
+#  1. Everything below 0x110000 keeps byte-identical offsets and sizes.
+#     nvsfactory at 0x9000 holds per-unit calibration that exists in no vendor
+#     download. Move or resize it and the data is unreachable or gone.
+#
+#  2. ota_0 starts at 0x110000, exactly where `factory` used to. The app flash
+#     address is therefore unchanged, so tooling and muscle memory both survive.
+#
+# With no `factory` partition, a blank otadata makes the bootloader run ota_0.
+# That is the intended state after flashing this table. The cost of dropping
+# factory is that two bad OTA images in a row need a USB recovery — which on
+# this board is a 6-second reflash, so it is a fair trade for 3 MB more storage.
+#
+# App partitions must be 64 KB aligned; data partitions 4 KB aligned.
+# Ends exactly on 0x1000000 (16 MB) with nothing stranded.
+#
+# Name,      Type, SubType,  Offset,    Size,      Flags
+nvsfactory,  data, nvs,      0x9000,    0x32000,
+nvs,         data, nvs,      0x3b000,   0xD2000,
+otadata,     data, ota,      0x10d000,  0x2000,
+phy_init,    data, phy,      0x10f000,  0x1000,
+ota_0,       app,  ota_0,    0x110000,  0x300000,
+ota_1,       app,  ota_1,    0x410000,  0x300000,
+storage,     data, spiffs,   0x710000,  0x8F0000,

@@ -1,0 +1,40 @@
+{
+  "$comment": [
+    "Device settings, tracked in git — this file is the source of truth, not a database.",
+    "The dashboard edits it, scripts/push.py applies it, and `git log` is the audit trail.",
+    "Intent lives here; observation (logs, flash history) lives in .data and stays untracked."
+  ],
+  "deviceId": "28848590ba0c",
+  "name": "beagledex",
+  "notes": "Waveshare ESP32-S3-Touch-AMOLED-1.8, v2 parts (CO5300 panel, CST820 touch).",
+
+  "channel": "dev",
+  "versionPin": null,
+
+  "power": {
+    "brightness": 255,
+    "dimAfterSec": 15,
+    "sleepAfterSec": 45
+  },
+
+  "face": {
+    "slot": 0,
+    "source": "faces/beagle.jpg",
+    "timeX": 40,
+    "timeY": 180,
+    "timeSize": 7,
+    "timeColour": "ffffff",
+    "showDate": true,
+    "holdMs": 3000
+  },
+
+  "apps": {
+    "enabled": ["app.clock", "app.ask", "app.system"]
+  },
+
+  "audio": {
+    "sampleRate": 16000,
+    "micGain": 2,
+    "maxSeconds": 30
+  }
+}
